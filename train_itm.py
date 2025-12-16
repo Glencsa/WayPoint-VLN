@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from transformers import InstructBlipProcessor, BertTokenizer
 from InstructBlip import InstructBlipMultiTask
+import swanlab
 # ==============================================================================
 # 2. Dataset 定义 (修改为返回 PIL)
 # ==============================================================================
@@ -109,32 +110,48 @@ def create_itm_batch(images, captions, image_names, dataset):
 # 4. 主训练循环
 # ==============================================================================
 if __name__ == "__main__":
-    # 配置路径
-    MODEL_NAME = "./instructblip-vicuna-7b" # 或者你的本地路径
+    args = {
+        "model_name": "./instructblip-vicuna-7b",
+        "data_root": "./flickr_30k",
+        "batch_size": 32,
+        "lr": 5e-5,
+        "epochs": 10,
+        "load_in_8bit": False,
+        "fusion_bias": -3.0 # 记录一下你的特殊初始化参数
+    }
+    
+    # <--- 【SwanLab 新增】2. 初始化实验 ---
+    swanlab.init(
+        project="InstructBlip-DualTower", # 项目名
+        experiment_name="full-finetune-v1", # 实验名
+        config=args, # 记录超参数
+        description="Training ITM head + Visual Fusion module with Depth Anything V2"
+    )
+    # --- 1. 配置路径 ---
+    MODEL_NAME = "./instructblip-vicuna-7b" 
     DATA_ROOT = "./flickr_30k"
     IMAGE_ROOT = os.path.join(DATA_ROOT, "flickr30k-images")
     CAPTION_FILE = os.path.join(DATA_ROOT, "captions_clean.token")
-    CHECKPOINT_DIR = "./checkpoints_itm_instructblip"
-    
-    # 显存优化参数
-    # 如果显存不够 (如 < 24G)，建议开启 load_in_8bit=True (需要安装 bitsandbytes)
-    LOAD_IN_8BIT = False 
-    BATCH_SIZE = 64 # 根据显存调整，InstructBlip 比 Qwen2VL 稍大
+    CHECKPOINT_DIR = "./checkpoints_itm_fusion" # 改个名区分一下
+    # RESUME_PATH = "./checkpoints_itm_fusion/checkpoint_step_10500.pth" 
+    RESUME_PATH = ""  # 不加载，重新训练
+    # --- 2. 显存与精度设置 ---
+    LOAD_IN_8BIT = False  # 显存<24G 时建议开启
+    BATCH_SIZE = 32      # 融合层增加了计算量，可能需要稍微调小 Batch Size
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    print("Loading Processor...")
+    print(f"Loading Processor from {MODEL_NAME}...")
     processor = InstructBlipProcessor.from_pretrained(MODEL_NAME)
-
-    print("Loading Model...")
-    
-    print("Loading Q-Former Tokenizer (BERT)...")
+    # Q-Former 必须使用 BERT Tokenizer (这是 InstructBLIP 的硬性要求)
     qformer_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    # 加载自定义模型
+
+    print("Loading Dual-Tower Model...")
+    # 加载我们自定义的双塔模型
     model = InstructBlipMultiTask.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16, # 强制 fp16 节省显存
+        torch_dtype=torch.bfloat16, 
         load_in_8bit=LOAD_IN_8BIT,
         device_map="auto" if LOAD_IN_8BIT else None
     )
@@ -142,26 +159,62 @@ if __name__ == "__main__":
     if not LOAD_IN_8BIT:
         model.to(device)
 
-    # --- 冻结参数 ---
-    print("Freezing parameters...")
+    # --- 3. 【核心修改】参数冻结与解冻 ---
+    print("Configuring trainable parameters...")
+    
+    trainable_modules = ["itm_head", "visual_fusion"] # 我们要训练的两个模块
+    
     for name, param in model.named_parameters():
-        if "itm_head" in name:
+        # 检查参数名是否包含我們要训练的模块名
+        is_trainable = any(module_name in name for module_name in trainable_modules)
+        
+        if is_trainable:
             param.requires_grad = True
-            # Head 建议用 fp32 训练以保证稳定，或者保持 fp16
-            param.data = param.data.to(torch.float32) 
+            # 【重要】训练的层建议转回 FP32，防止 Loss NaN 或梯度下溢
+            param.data = param.data.to(torch.bfloat16) 
+            print(f"  -> Unfrozen: {name}") 
         else:
             param.requires_grad = False
             
-    # 打印可训练参数
+    # 计算参数量
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable Parameters (ITM Head): {trainable_params}")
+    print(f"Total Trainable Parameters: {trainable_params / 1e6:.2f} M")
+    
+    if os.path.exists(RESUME_PATH):
+        print(f"🔄正在加载权重: {RESUME_PATH} ...")
+        
+        # 1. 读取文件
+        checkpoint = torch.load(RESUME_PATH, map_location=device)
+        
+        # 2. 分别加载 visual_fusion 和 itm_head
+        # 注意：因为我们保存的是个字典 {'visual_fusion': ..., 'itm_head': ...}
+        # 所以不能直接 model.load_state_dict(checkpoint)
+        
+        try:
+            model.visual_fusion.load_state_dict(checkpoint['visual_fusion'])
+            print("  ✅ Visual Fusion 权重加载成功")
+        except KeyError:
+            print("  ⚠️ 警告: Checkpoint 中未找到 visual_fusion")
+            
+        try:
+            model.itm_head.load_state_dict(checkpoint['itm_head'])
+            print("  ✅ ITM Head 权重加载成功")
+        except KeyError:
+            print("  ⚠️ 警告: Checkpoint 中未找到 itm_head")
+            
+        print("🚀 权重加载完毕，准备继续训练！")
+    else:
+        print(f"⚠️ 未找到路径 {RESUME_PATH}，将从头开始训练！")
+    # --- 5. 优化器 ---
+    # 只传入 requires_grad=True 的参数
+    # 修改优化器定义
+    fusion_params = list(map(id, model.visual_fusion.parameters()))
+    base_params = filter(lambda p: id(p) not in fusion_params and p.requires_grad, model.parameters())
 
-    # 优化器
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=1e-4,
-        weight_decay=0.01
-    )
+    optimizer = torch.optim.AdamW([
+        {'params': base_params, 'lr': 5e-5}, # Head 保持小 LR
+        {'params': model.visual_fusion.parameters(), 'lr': 5e-4} # Fusion 层大 LR (放大10倍)
+    ], weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000)
     
     # 数据加载
@@ -170,20 +223,18 @@ if __name__ == "__main__":
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=16,
-        collate_fn=collate_fn # 使用新的 collate
+        num_workers=4, # 适当降低 worker 防止内存爆炸
+        collate_fn=collate_fn 
     )
 
-    print("Start ITM training...")
+    print("Start Dual-Tower ITM training...")
     
     criterion = nn.CrossEntropyLoss()
-    num_epochs = 100
+    num_epochs = 10
     save_every_steps = 500
     global_step = 0
     
-    loss_list = []
-    
-    model.train() # 开启 Dropout 等
+    model.train() 
 
     for epoch in range(num_epochs):
         epoch_loss = 0
@@ -191,47 +242,47 @@ if __name__ == "__main__":
         steps_in_epoch = 0
         
         for step, (images, captions, image_names) in enumerate(dataloader):
-            # 1. 构造正负样本
+            # A. 构造正负样本 (Batch Size * 2)
             itm_images_pil, itm_texts, itm_labels = create_itm_batch(
                 images, captions, image_names, dataset
             )
             itm_labels = itm_labels.to(device)
             
-            # 2. 【修改部分】分开处理图片和文本
-            
-            # A. 处理图片 (使用原版 Processor，只传 images)
+            # B. 数据预处理
+            # 图片 -> RGB Tensor
             image_inputs = processor(
                 images=itm_images_pil,
                 return_tensors="pt"
             ).to(device)
             
-            # B. 处理文本 (使用 BERT Tokenizer)
-            # 这生成的才是 Q-Former 能看懂的 IDs (0-30522)
+            # 文本 -> Q-Former Token IDs
             text_inputs = qformer_tokenizer(
                 itm_texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=32 # ITM 文本通常不长，Q-Former 也不需要太长
+                max_length=32 
             ).to(device)
             
-            # 3. 前向传播
+            # C. 前向传播
             optimizer.zero_grad()
             
-            # 这里的 input_ids 来自 BERT tokenizer，绝对安全
+            # 调用 forward_itm (内部会自动调用 Depth backbone 和 Fusion)
             logits = model.forward_itm(
-                pixel_values=image_inputs.pixel_values.to(dtype=torch.float16),
-                input_ids=text_inputs.input_ids,         # <--- 使用 BERT 的 ID
-                attention_mask=text_inputs.attention_mask # <--- 使用 BERT 的 Mask
+                pixel_values=image_inputs.pixel_values.to(dtype=torch.bfloat16),
+                input_ids=text_inputs.input_ids,         
+                attention_mask=text_inputs.attention_mask 
             )
             
             loss = criterion(logits, itm_labels)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # print(f"Gate Bias Grad: {model.visual_fusion.gate_net[-2].bias.grad}")
             optimizer.step()
             
-            # 4. 统计
+            # D. 统计与日志
+            preds = logits.argmax(dim=1)
             acc = (logits.argmax(dim=1) == itm_labels).float().mean().item()
             loss_val = loss.item()
             
@@ -239,16 +290,38 @@ if __name__ == "__main__":
             epoch_acc += acc
             steps_in_epoch += 1
             global_step += 1
-            loss_list.append(loss_val)
-
+            swanlab.log({
+                            "train/loss": loss_val,
+                            "train/acc": acc,
+                            "train/lr": optimizer.param_groups[0]['lr']
+                        })
+            if step % 100 == 0:
+                # 取 Batch 里的第一张图做展示
+                # 记录：原始图片 + 文本 + 真实标签 + 预测标签
+                log_image = swanlab.Image(
+                    itm_images_pil[0], 
+                    caption=f"Text: {itm_texts[0]} | GT: {itm_labels[0]} | Pred: {preds[0].item()}"
+                )
+                swanlab.log({"val/visualization": log_image})
             if step % 10 == 0:
                 print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step}/{len(dataloader)}], "
                       f"Loss: {loss_val:.4f}, Acc: {acc:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
+                
+                # 监控 Gate 的值 (可选，调试用)
+                # 我们可以看看 Gate 是否从 0 开始逐渐变大
+                with torch.no_grad():
+                   print(f"  Sample Gate Value: {model.visual_fusion.gate_net[-2].bias.data[0]:.4f} (Bias)")
 
+            # --- 6. 【核心修改】保存逻辑 ---
             if global_step % save_every_steps == 0:
                 ckpt_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_step_{global_step}.pth")
-                # 只保存 head 的权重，极大节省空间
-                torch.save(model.itm_head.state_dict(), ckpt_path)
+                
+                # 我们需要保存两个部分：Fusion Layer 和 ITM Head
+                save_dict = {
+                    "visual_fusion": model.visual_fusion.state_dict(),
+                    "itm_head": model.itm_head.state_dict()
+                }
+                torch.save(save_dict, ckpt_path)
                 print(f"Checkpoint saved -> {ckpt_path}")
 
         scheduler.step()
@@ -258,6 +331,10 @@ if __name__ == "__main__":
         print(f"=== Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f}, Avg Acc: {avg_acc:.4f} ===")
 
     # 保存最终结果
-    final_path = os.path.join(CHECKPOINT_DIR, "final_itm_head.pth")
-    torch.save(model.itm_head.state_dict(), final_path)
-    print(f"Training Done. Final head saved to {final_path}")
+    final_path = os.path.join(CHECKPOINT_DIR, "final_dual_tower.pth")
+    save_dict = {
+        "visual_fusion": model.visual_fusion.state_dict(),
+        "itm_head": model.itm_head.state_dict()
+    }
+    torch.save(save_dict, final_path)
+    print(f"Training Done. Final weights saved to {final_path}")
