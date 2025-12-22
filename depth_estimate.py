@@ -110,11 +110,6 @@ if __name__ == "__main__":
         image = Image.open(img_path).convert("RGB")
     
     print("正在推理...")
-    
-    # 3. 获取并保存彩色深度图 (使用 INFERNO 配色)
-    depth_image_inferno = estimator.predict_depth(image, return_type="pil", colormap=cv2.COLORMAP_INFERNO)
-    depth_image_inferno.save("depth_result_inferno.png")
-    print("✅ 保存成功: depth_result_inferno.png (烈焰色)")
 
     # 4. 获取并保存彩色深度图 (使用 JET 彩虹色)
     depth_image_jet = estimator.predict_depth(image, return_type="pil", colormap=cv2.COLORMAP_JET)
