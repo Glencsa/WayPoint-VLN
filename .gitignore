@@ -48,3 +48,4 @@ checkpoints_itm_fusion
 checkpoints_itm_cross_attn
 images/
 dataset_instructblip.json
+vit-base-patch16-224/

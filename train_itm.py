@@ -7,7 +7,8 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 from transformers import InstructBlipProcessor, BertTokenizer,InstructBlipConfig
 from transformers import AutoTokenizer
-from models.InstructBlip import InstructBlipMultiTask 
+from models.rvln import InstructBlipMultiTask 
+from models.depth_estimate import DepthEstimator
 import swanlab
 
 # ==============================================================================
@@ -34,7 +35,8 @@ class Flickr30kDataset(Dataset):
         for image_name, captions in self.image_to_captions.items():
             for caption in captions:
                 self.samples.append((image_name, caption))
-        
+        # device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.estimator = DepthEstimator(model_id="./Depth-Anything-V2-Small-hf", device="cpu")
         self.image_names = list(self.image_to_captions.keys())
         print(f"数据集加载完成，共 {len(self.samples)} 个样本。")
 
@@ -50,83 +52,95 @@ class Flickr30kDataset(Dataset):
         except Exception as e:
             print(f"Error loading image {image_path}: {e}")
             img = Image.new('RGB', (224, 224), color='black')
-            
-        return img, caption, image_name
+        depth_image_jet = self.estimator.predict_depth(img, return_type="pil")
+        return img, depth_image_jet, caption, image_name
 
 def collate_fn(batch):
-    images, captions, image_names = zip(*batch)
-    return list(images), list(captions), list(image_names)
+    images, depth_images, captions, image_names = zip(*batch)
+    return list(images), list(depth_images), list(captions), list(image_names)
 
-# ==============================================================================
-# 3. 负采样逻辑 (保持不变)
-# ==============================================================================
-def create_itm_batch(images, captions, image_names, dataset):
+def create_itm_batch(images, depth_images, captions, image_names, dataset):
     """
-    dataset: 这里必须传入原始的 Flickr30kDataset 对象，
-    因为 random_split 产生的 Subset 对象没有 image_names 属性。
+    dataset: 可以是 Flickr30kDataset 或 torch.utils.data.Subset
     """
     batch_size = len(images)
-    positive_images = list(images) 
+    positive_images = list(images)
+    positive_depth_images = list(depth_images)
     positive_texts = list(captions)
     positive_labels = [1] * batch_size
-    
-    negative_images = list(images) 
-    negative_texts = [] 
-    
+
+    negative_images = list(images)
+    negative_depth_images = list(depth_images)
+    negative_texts = []
+
+    # 1. 识别是否为 Subset，获取正确的数据源和索引范围
+    if isinstance(dataset, torch.utils.data.Subset):
+        source_dataset = dataset.dataset  # 获取原始数据集(Flickr30kDataset)
+        valid_indices = dataset.indices   # 获取当前划分(训练/验证)的有效索引列表
+    else:
+        source_dataset = dataset
+        valid_indices = range(len(dataset)) # 如果是全量数据集，索引就是 0 到 len-1
+
     for i in range(batch_size):
         current_image_name = image_names[i]
         while True:
-            # 从全局数据集中随机取负样本
-            random_idx = random.randint(0, len(dataset.samples) - 1)
-            other_image_name, other_caption = dataset.samples[random_idx]
+            # 2. 从当前划分(Subset)的有效索引中随机选择
+            random_idx = random.choice(valid_indices)
+            
+            # 3. 从源数据集中获取元数据 (name, caption)
+            # 注意：这里直接访问 samples 列表，避免调用 __getitem__ 加载图片，提高速度
+            other_image_name, other_caption = source_dataset.samples[random_idx]
+            
             if other_image_name != current_image_name:
                 negative_texts.append(other_caption)
                 break
     
     negative_labels = [0] * batch_size
     all_images = positive_images + negative_images
+    all_depth_images = positive_depth_images + negative_depth_images
     all_texts = positive_texts + negative_texts
     all_labels = positive_labels + negative_labels
-    
-    combined = list(zip(all_images, all_texts, all_labels))
+
+    combined = list(zip(all_images, all_depth_images, all_texts, all_labels))
     random.shuffle(combined)
-    
-    all_images, all_texts, all_labels = zip(*combined)
-    return list(all_images), list(all_texts), torch.tensor(all_labels, dtype=torch.long)
+
+    all_images, all_depth_images, all_texts, all_labels = zip(*combined)
+    return list(all_images), list(all_depth_images), list(all_texts), torch.tensor(all_labels, dtype=torch.long)
 
 # ==============================================================================
 # [新增] 验证函数
 # ==============================================================================
-def validate(model, dataloader, full_dataset, device, processor, tokenizer, criterion):
-    model.eval() # 切换到评估模式
+# 修改函数签名，将 full_dataset 改为 val_dataset (命名更准确)
+def validate(model, dataloader, val_dataset, device, processor, tokenizer, criterion):
+    model.eval()
     total_loss = 0
     total_acc = 0
     steps = 0
     
     print("\n[Validation] Starting evaluation on validation set...")
-    with torch.no_grad(): # 禁用梯度计算
-        for step, (images, captions, image_names) in enumerate(dataloader):
-            # 1. 构造验证用的正负样本
-            # 注意：传入 full_dataset 引用以获取负样本池
-            itm_images_pil, itm_texts, itm_labels = create_itm_batch(
-                images, captions, image_names, full_dataset
+    with torch.no_grad():
+        for step, (images, depth_images, captions, image_names) in enumerate(dataloader):
+            # 传入 val_dataset (Subset对象)
+            # 修正后的 create_itm_batch 会自动处理 Subset，只从验证集中选负样本
+            itm_images_pil, itm_depth_images, itm_texts, itm_labels = create_itm_batch(
+                images, depth_images, captions, image_names, val_dataset
             )
             itm_labels = itm_labels.to(device)
             
-            # 2. 预处理
+            # ... (后续代码保持不变) ...
             image_inputs = processor(images=itm_images_pil, return_tensors="pt").to(device)
+            depth_inputs = processor(images=itm_depth_images, return_tensors="pt").to(device)
             text_inputs = tokenizer(
                 itm_texts, return_tensors="pt", padding=True, truncation=True, max_length=32
             ).to(device)
             
-            # 3. 前向传播
             logits = model.forward_itm(
                 pixel_values=image_inputs.pixel_values.to(dtype=torch.bfloat16),
-                input_ids=text_inputs.input_ids,         
-                attention_mask=text_inputs.attention_mask 
+                depth_pixel_values=depth_inputs.pixel_values.to(dtype=torch.bfloat16),
+                input_ids=text_inputs.input_ids,
+                attention_mask=text_inputs.attention_mask
             )
             
-            # 4. 计算指标
             loss = criterion(logits, itm_labels)
             acc = (logits.argmax(dim=1) == itm_labels).float().mean().item()
             
@@ -134,8 +148,8 @@ def validate(model, dataloader, full_dataset, device, processor, tokenizer, crit
             total_acc += acc
             steps += 1
             
-    avg_loss = total_loss / steps
-    avg_acc = total_acc / steps
+    avg_loss = total_loss / steps if steps > 0 else 0
+    avg_acc = total_acc / steps if steps > 0 else 0
     print(f"[Validation] Done. Avg Loss: {avg_loss:.4f}, Avg Acc: {avg_acc:.4f}\n")
     return avg_loss, avg_acc
 
@@ -165,7 +179,7 @@ if __name__ == "__main__":
     DATA_ROOT = "./flickr_30k"
     IMAGE_ROOT = os.path.join(DATA_ROOT, "flickr30k-images")
     CAPTION_FILE = os.path.join(DATA_ROOT, "captions_clean.token")
-    CHECKPOINT_DIR = "./checkpoints_itm_cross_attn" 
+    CHECKPOINT_DIR = "./checkpoints_itm_cross_attn_with_depth" 
     
     LOAD_IN_8BIT = False 
     BATCH_SIZE = 32     
@@ -227,11 +241,9 @@ if __name__ == "__main__":
     # --- 【核心修改】数据划分 ---
     full_dataset = Flickr30kDataset(IMAGE_ROOT, CAPTION_FILE)
     
-    # 90% 训练, 10% 验证
     val_size = int(len(full_dataset) * 0.1)
     train_size = len(full_dataset) - val_size
     
-    # 固定种子，保证每次划分一致
     train_dataset, val_dataset = random_split(
         full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
     )
@@ -254,14 +266,15 @@ if __name__ == "__main__":
     for epoch in range(num_epochs):
         # 1. 训练阶段
         model.train()
-        for step, (images, captions, image_names) in enumerate(train_loader):
-            # 这里的 full_dataset 用于提供负样本池
-            itm_images_pil, itm_texts, itm_labels = create_itm_batch(
-                images, captions, image_names, full_dataset
+        for step, (images, depth_images, captions, image_names) in enumerate(train_loader):
+            # 这里的 train_dataset 用于提供负样本池
+            itm_images_pil, itm_depth_images, itm_texts, itm_labels = create_itm_batch(
+                images, depth_images, captions, image_names, train_dataset
             )
             itm_labels = itm_labels.to(device)
             
             image_inputs = processor(images=itm_images_pil, return_tensors="pt").to(device)
+            depth_inputs = processor(images=itm_depth_images, return_tensors="pt").to(device)
             text_inputs = qformer_tokenizer(
                 itm_texts, return_tensors="pt", padding=True, truncation=True, max_length=32 
             ).to(device)
@@ -269,8 +282,9 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             logits = model.forward_itm(
                 pixel_values=image_inputs.pixel_values.to(dtype=torch.bfloat16),
-                input_ids=text_inputs.input_ids,         
-                attention_mask=text_inputs.attention_mask 
+                depth_pixel_values=depth_inputs.pixel_values.to(dtype=torch.bfloat16),
+                input_ids=text_inputs.input_ids,
+                attention_mask=text_inputs.attention_mask
             )
             
             loss = criterion(logits, itm_labels)
@@ -299,7 +313,7 @@ if __name__ == "__main__":
                 "train/fusion_grad_norm": fusion_grad_norm
             })
             
-            if step % 50 == 0:
+            if step % 5 == 0:
                 print(f"[Epoch {epoch+1}][Step {step}] Train Loss: {loss_val:.4f}, Acc: {acc:.4f}")
 
             # 定期保存普通 Checkpoint
@@ -313,8 +327,8 @@ if __name__ == "__main__":
         scheduler.step()
         
         # 2. 验证阶段 (每个 Epoch 结束后)
-        val_loss, val_acc = validate(model, val_loader, full_dataset, device, processor, qformer_tokenizer, criterion)
-        
+        val_loss, val_acc = validate(model, val_loader, val_dataset, device, processor, qformer_tokenizer, criterion)
+
         # SwanLab Log (Validation)
         swanlab.log({
             "val/loss": val_loss,
