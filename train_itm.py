@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 from transformers import InstructBlipProcessor, BertTokenizer,InstructBlipConfig
 from transformers import AutoTokenizer
-from InstructBlip import InstructBlipMultiTask 
+from models.InstructBlip import InstructBlipMultiTask 
 import swanlab
 
 # ==============================================================================

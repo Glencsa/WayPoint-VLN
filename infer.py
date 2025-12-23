@@ -7,7 +7,7 @@ from io import BytesIO
 import numpy as np # 新增 numpy 用于检查 NaN
 
 # 引入定义好的模型类
-from InstructBlip import InstructBlipMultiTask
+from models.InstructBlip import InstructBlipMultiTask
 from transformers import (
     InstructBlipProcessor,
     BertTokenizer

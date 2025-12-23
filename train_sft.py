@@ -15,7 +15,7 @@ from peft import (
 )
 
 # 假设你的代码保存在这些文件中
-from InstructBlip import InstructBlipMultiTask  # 你提供的模型类
+from models.InstructBlip import InstructBlipMultiTask  # 你提供的模型类
 from data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip # 你提供的数据集类
 
 def print_trainable_parameters(model):
