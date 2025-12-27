@@ -55,3 +55,4 @@ checkpoints_itm_cross_attn_with_depth_qformer_vit/
 checkpoints_itm_cross_attn_with_depth_qformer_vit_v1/
 output/
 datasets/
+checkpoint/

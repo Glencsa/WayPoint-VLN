@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from transformers import (
     InstructBlipProcessor,
     InstructBlipConfig,
@@ -74,10 +73,9 @@ class CustomTrainer(Trainer):
         super().save_model(output_dir, _internal_call)
         
         # 2. 保存 Tokenizer
-        if self.is_world_process_zero():
-            self.tokenizer.save_pretrained(output_dir)
-            
-            print(f"✅ Model (LoRA + Embeddings) saved to {output_dir}")
+        self.tokenizer.save_pretrained(output_dir)
+        
+        print(f"✅ Model (LoRA + Embeddings) saved to {output_dir}")
 
 def main():
     # =================Configuration=================
@@ -208,7 +206,7 @@ def main():
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accumulation,
         learning_rate=learning_rate,
-        logging_steps=2,
+        logging_steps=10,
         save_strategy="steps",
         save_steps=500,
         num_train_epochs=num_epochs,
@@ -216,7 +214,7 @@ def main():
         deepspeed="./ds_config_zero2.json",
         remove_unused_columns=False,
         save_total_limit=1,
-        report_to="none",
+        report_to="none", # ⚠️ 建议设为 none，完全通过下方的 callback 控制 swanlab
     )
 
     # 使用自定义 Trainer
@@ -232,13 +230,11 @@ def main():
     )
 
     trainer.train()
-    trainer.accelerator.wait_for_everyone()
     
-    # 仅由主进程触发保存逻辑（或者 trainer.save_model 内部会处理，但加上 wait 更安全）
-    if trainer.is_world_process_zero():
-        trainer.save_model(output_dir)
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    trainer.save_model(output_dir)
+    
+    # 训练结束，结束 swanlab 记录 (可选，脚本结束会自动调用)
+    # swanlab.finish()
 
 if __name__ == "__main__":
     main()

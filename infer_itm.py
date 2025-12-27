@@ -20,7 +20,7 @@ def run_inference():
     # 1. 基础配置
     # =================================================
     MODEL_ID = "./instructblip-vicuna-7b"
-    CHECKPOINT_PATH = "checkpoints_itm_cross_attn_with_depth_qformer_vit/latest_checkpoint.pth"
+    CHECKPOINT_PATH = "checkpoint/latest_checkpoint.pth"
     
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     # ITM 推理建议使用 float16 或 bfloat16

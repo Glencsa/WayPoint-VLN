@@ -79,7 +79,7 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         if not hasattr(config, 'current_token_id') or config.current_token_id is None:
             raise ValueError("Config must contain 'current_token_id'")
         
-        # === 修改 1: 加载标准 ViT 作为深度编码器 (替代原来的 Estimator) ===
+        # === 加载标准 ViT 作为深度编码器 (替代原来的 Estimator) ===
         # 我们使用 ImageNet 预训练的 ViT-Base 来提取深度图特征
         depth_encoder_name = "./vit-base-patch16-224"
         print(f"Loading Depth Encoder: {depth_encoder_name}...")
@@ -89,7 +89,7 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         for param in self.depth_backbone.parameters():
             param.requires_grad = False
             
-        # === 修复: 定义 decay_rate ===
+        # === 定义 decay_rate ===
         self.decay_rate = 0.8
 
         self.rgb_hidden_size = config.vision_config.hidden_size # 1408
@@ -118,8 +118,6 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-
-    # === 修改 2: get_fused_visual_features 接收 depth_pixel_values ===
     def get_fused_visual_features(self, pixel_values, depth_pixel_values, qformer_input_ids, qformer_attention_mask):
         """
         pixel_values:       [B, Num_Images, 3, H, W] (RGB)
@@ -136,40 +134,50 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         rgb_embeds = rgb_outputs.last_hidden_state # [B*5, N_patches, 1408]
 
         # 2. 展平并提取 Depth 特征
-        # 处理 depth_pixel_values
         flat_depth_values = depth_pixel_values.view(b * num_images, -1, h, w)
         
-        # 兼容性处理：如果深度图是单通道，复制为 3 通道以适配 ViT 权重
+        # 兼容性处理
         if flat_depth_values.shape[1] == 1:
             flat_depth_values = flat_depth_values.repeat(1, 3, 1, 1)
         
-        # 确保类型一致 (通常是 bfloat16)
+        # 确保类型一致
         flat_depth_values = flat_depth_values.to(dtype=self.depth_backbone.dtype)
 
         with torch.no_grad():
             self.depth_backbone.eval()
-            # 直接通过 ViT Encoder
             depth_outputs = self.depth_backbone(pixel_values=flat_depth_values, return_dict=True)
-            depth_raw = depth_outputs.last_hidden_state # [B*5, N_depth, 768]
+            depth_raw = depth_outputs.last_hidden_state 
             
             if depth_raw.dtype != rgb_embeds.dtype:
                 depth_raw = depth_raw.to(rgb_embeds.dtype)
 
         # 3. 融合 RGB 和 Depth
+        # image_embeds 所在的设备就是我们后续计算的主设备 (Target Device)
         image_embeds = self.visual_fusion(rgb_embeds, depth_raw)
-        
-        # 4. 准备 Q-Former 输入
-        image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device)
-        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-        
-        flat_qformer_input_ids = qformer_input_ids.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
-        flat_qformer_attention_mask = qformer_attention_mask.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
+        target_device = image_embeds.device  # <--- 获取当前特征所在的设备
 
+        # 4. 准备 Q-Former 输入
+        # 确保 image_attention_mask 在正确的设备上
+        image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=target_device)
+        
+        # 确保 query_tokens 在正确的设备上
+        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1).to(target_device)
+        
+        # === 强制将输入数据移动到 target_device ===
+        flat_qformer_input_ids = qformer_input_ids.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
+        flat_qformer_input_ids = flat_qformer_input_ids.to(target_device) # <--- 移动 Input IDs
+
+        flat_qformer_attention_mask = qformer_attention_mask.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
+        flat_qformer_attention_mask = flat_qformer_attention_mask.to(target_device) # <--- 移动 Attention Mask
+
+        # 创建 query mask (也在 target_device)
         query_attention_mask = torch.ones(
             (b * num_images, query_tokens.shape[1]),
             dtype=torch.long,
-            device=image_embeds.device
+            device=target_device 
         )
+        
+        # 现在 concat 就不会报错了，因为两者都在 target_device 上
         qformer_attention_mask_full = torch.cat([query_attention_mask, flat_qformer_attention_mask], dim=1)
         
         # 5. Q-Former 前向传播
@@ -184,11 +192,9 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         
         qformer_output = query_outputs.last_hidden_state
         
-        # === 修复: 截断文本特征，只保留 Visual Query Tokens ===
-        num_queries = self.query_tokens.shape[1] # 32
+        # 截断与投影
+        num_queries = self.query_tokens.shape[1] 
         qformer_output = qformer_output[:, :num_queries, :] 
-        
-        # === 修复: 投影到 LLM 维度 (768 -> 4096) ===
         qformer_output = self.language_projection(qformer_output)
 
         # 6. 时序衰减与重组
@@ -196,7 +202,8 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         
         _, num_frames, _, _ = qformer_output.shape
         decay_factors = torch.tensor([self.decay_rate ** (num_frames - 1 - i) for i in range(num_frames)])
-        decay_factors = decay_factors.view(1, num_frames, 1, 1).to(qformer_output.device).to(qformer_output.dtype)
+        # 确保 decay_factors 也在正确的设备和 dtype 上
+        decay_factors = decay_factors.view(1, num_frames, 1, 1).to(device=target_device, dtype=qformer_output.dtype)
 
         qformer_output = qformer_output * decay_factors
 
@@ -206,7 +213,7 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         
         return history_feats, current_feats
 
-    # === 修复: 健壮的 Token 替换逻辑 ===
+    # === 健壮的 Token 替换逻辑 ===
     def _replace_image_tokens(self, inputs_embeds, input_ids, history_feats, current_feats, history_token_id, current_token_id):
         # 强制类型一致
         history_feats = history_feats.to(inputs_embeds.dtype)
