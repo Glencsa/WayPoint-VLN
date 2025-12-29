@@ -32,7 +32,7 @@ class MockProcessor:
 
 def main():
     # 配置你的真实文件路径
-    json_path = "datasets/filtered_traj_3279.json"
+    json_path = "dataset_waypoint/rgb_images_r2r_train_processed.json"
     
     # ⚠️ 关键：如果 json 里的路径已经是 "datasets/test/..."
     # 且你的脚本在根目录，那么 image_root 应该是 "." (当前目录)

@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.utils.data import random_split
 from transformers import (
     InstructBlipProcessor,
     InstructBlipConfig,
@@ -38,6 +39,7 @@ def print_trainable_parameters(model):
         f"trainable params: {trainable_params} || all params: {all_param} || "
         f"trainable%: {100 * trainable_params / all_param:.2f}"
     )
+
 
 # ==========================================
 # 2. 修正 Data Collator 以匹配模型输入
@@ -79,14 +81,83 @@ class CustomTrainer(Trainer):
             
             print(f"✅ Model (LoRA + Embeddings) saved to {output_dir}")
 
+class WeightedTrainer(CustomTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 获取数字 -1, 0-8 的 Token ID
+        # 注意：不同 Tokenizer 对数字的处理不同，有可能是 "8" 也有可能是 " 8" (带空格)
+        # 这里把常见可能都加进去，确保万无一失
+        self.target_tokens = set()
+        for i in range(-1, 9): # -1 到 8
+            # 纯数字
+            self.target_tokens.add(self.tokenizer.convert_tokens_to_ids(str(i)))
+            # 带空格的数字 (SentencePiece 常见)
+            self.target_tokens.add(self.tokenizer.convert_tokens_to_ids(" " + str(i)))
+        
+        # 处理 "-1" 这种情况，Tokenzier 可能会把它拆成 "-" 和 "1"
+        # 如果你想把 "-" 也加权，可以加上
+        self.target_tokens.add(self.tokenizer.convert_tokens_to_ids("-"))
+
+        # 权重倍数：关键 Token 的 Loss 放大 10 倍
+        self.key_token_weight = 10.0
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        重写 Loss 计算逻辑，对数字 Token 进行加权
+        """
+        # 1. 正常的前向传播
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        
+        # 2. 获取 Logits
+        logits = outputs.get("logits")
+        
+        # 3. 移位 (Shift) 以适配 Causal LM
+        # 预测第 i 个 token 用的是第 i-1 个 token 的输出
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        # 4. 展平
+        batch_size, seq_len, vocab_size = shift_logits.shape
+        flat_logits = shift_logits.view(-1, vocab_size)
+        flat_labels = shift_labels.view(-1)
+        
+        # 5. 计算未缩减的 CrossEntropy Loss (reduction='none')
+        # 这样我们会得到每一个 Token 的 Loss，而不是一个平均值
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        # 只需要计算 label != -100 的部分
+        token_losses = loss_fct(flat_logits, flat_labels)
+        
+        # 6. 创建权重 Mask
+        # 默认权重为 1.0
+        weights = torch.ones_like(token_losses)
+        
+        # 找到 Label 是数字的地方，将权重设为 10.0
+        # 这是一个 Tensor 操作，速度很快
+        for target_id in self.target_tokens:
+            weights[flat_labels == target_id] = self.key_token_weight
+            
+        # 7. 应用权重
+        weighted_loss = token_losses * weights
+        
+        # 8. 取平均 (只对非 Mask 的部分取平均)
+        # 统计有效 Token 数量 (labels != -100)
+        active_elements = (flat_labels != -100).sum()
+        
+        if active_elements > 0:
+            final_loss = weighted_loss.sum() / active_elements
+        else:
+            final_loss = weighted_loss.sum()
+
+        return (final_loss, outputs) if return_outputs else final_loss
 def main():
     # =================Configuration=================
     model_name_or_path = "./instructblip-vicuna-7b" 
     # 之前训练好的 Stage 1 权重路径 (包含 Fusion, Q-Former, Depth 等)
     stage1_checkpoint = "checkpoint/latest_checkpoint.pth"
     
-    data_path = "datasets/filtered_traj_3279.json"
-    output_dir = "./output/instructblip_sft_llm"
+    data_path = "dataset_waypoint/rgb_images_r2r_train_processed.json"
+    output_dir = "./output/rvln_sft_llm"
     
     # 训练参数
     batch_size = 2
@@ -184,9 +255,9 @@ def main():
     
     print_trainable_parameters(model)
 
-    # =================5. Data Setup=================
-    print("Loading Dataset...")
-    train_dataset = InstructBlipLoRADataset(
+# ================= 5. Data Setup (关键修改：划分验证集) =================
+    print("Loading Full Dataset...")
+    full_dataset = InstructBlipLoRADataset(
         data_path=data_path,
         processor=processor,
         tokenizer=tokenizer,
@@ -195,37 +266,62 @@ def main():
         current_len=1
     )
     
-    # 使用 Wrapper 后的 Collator
+    # [新增] 计算划分数量
+    val_ratio = 0.01  # 1% 做验证，99% 训练
+    val_size = int(len(full_dataset) * val_ratio)
+    train_size = len(full_dataset) - val_size
+    
+    print(f"Splitting Dataset: Total={len(full_dataset)} | Train={train_size} | Val={val_size}")
+    
+    # [新增] 随机切分
+    # generator用于固定随机种子，保证每次切分一样，方便复现
+    train_dataset, eval_dataset = random_split(
+        full_dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42) 
+    )
+    
     collator = DataCollatorWrapper(
         processor=processor,
         tokenizer=tokenizer,
         qformer_tokenizer=qformer_tokenizer
     )
 
-    # =================6. Trainer Setup=================
+    # ================= 6. Trainer Setup (关键修改：添加 Eval 配置) =================
     training_args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accumulation,
         learning_rate=learning_rate,
-        logging_steps=2,
-        save_strategy="steps",
-        save_steps=500,
         num_train_epochs=num_epochs,
         fp16=True,
         deepspeed="./ds_config_zero2.json",
         remove_unused_columns=False,
-        save_total_limit=1,
         report_to="none",
+        
+        # --- [新增] 验证集相关配置 ---
+        evaluation_strategy="steps",   # 按步数评估 (也可以选 "epoch")
+        eval_steps=1000,                # 每 100 步评估一次验证集 (根据你总步数调整)
+        per_device_eval_batch_size=batch_size, # 验证集的 Batch Size
+        
+        # --- [新增] 模型保存策略 (Save Best) ---
+        save_strategy="steps",         # 必须和 evaluation_strategy 一致
+        save_steps=2000,                # 每 2000 步尝试保存
+        save_total_limit=2,            # 最多保留 2 个 checkpoint，省硬盘
+        load_best_model_at_end=True,   # 训练结束时，自动加载验证集效果最好的模型
+        metric_for_best_model="loss",  # 以 loss 为标准 (loss 越小越好)
+        greater_is_better=False,       # loss 是越小越好，所以是 False
+        logging_steps=5,
     )
 
     # 使用自定义 Trainer
-    trainer = CustomTrainer(
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         # ================= [SwanLab] 3. 添加 Callback =================
         # SwanLabCallback 会自动记录 Loss, LR, Epoch 等信息
         callbacks=[SwanLabCallback()]
