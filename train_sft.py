@@ -23,7 +23,7 @@ import swanlab
 from swanlab.integration.huggingface import SwanLabCallback
 
 # 引入你的自定义模块
-from models.rvln import InstructBlipMultiTask 
+from models.rvln import RvlnMultiTask 
 # 引入你上面提供的 Dataset 和 Collator 类
 from data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip 
 
@@ -53,7 +53,7 @@ class DataCollatorWrapper(DataCollatorForInstructBlip):
     def __call__(self, batch):
         outputs = super().__call__(batch)
         
-        # 重命名键值以匹配 InstructBlipMultiTask.forward 的参数
+        # 重命名键值以匹配 RvlnMultiTask.forward 的参数
         if "pixel_values_rgb" in outputs:
             outputs["pixel_values"] = outputs.pop("pixel_values_rgb")
         
@@ -150,6 +150,63 @@ class WeightedTrainer(CustomTrainer):
             final_loss = weighted_loss.sum()
 
         return (final_loss, outputs) if return_outputs else final_loss
+
+
+
+class ClassificationTrainer(CustomTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+            Loss 计算逻辑，适配分类任务 (-1 到 8)，并记录训练准确率 (Train Acc)
+        """
+        # 1. 获取分类标签
+        labels = inputs.get("class_labels")
+        if labels is None:
+            labels = inputs.get("labels") 
+            
+        # 2. 前向传播
+        outputs = model(**inputs)
+        
+        # 3. 获取 Logits [Batch_Size, 10]
+        logits = outputs.get("logits")
+        
+        # 4. 计算 CrossEntropyLoss
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(logits, labels)
+
+        if logits is not None:
+            with torch.no_grad():
+                # 1. 获取预测类别 (argmax 找概率最大的下标)
+                preds = torch.argmax(logits, dim=-1)
+                
+                # 2. 计算准确率 (正确数 / 总数)
+                accuracy = (preds == labels).float().mean().item()
+                
+                # 3. 手动记录到日志 (会显示在 SwanLab 的 train/accuracy 图表中)
+                # 为了防止日志刷屏，我们只在 Trainer 到了 logging_steps 时才记录
+                # (注意：self.state.global_step 是当前步数)
+                if self.state.global_step % self.args.logging_steps == 0:
+                    self.log({"train/accuracy": accuracy})
+
+        return (loss, outputs) if return_outputs else loss
+
+
+
+def compute_metrics(eval_pred):
+    """
+    专门用于 Trainer 评估验证集时的回调函数
+    """
+    logits, labels = eval_pred
+    # logits 是 numpy 数组，需要取 argmax
+    predictions = np.argmax(logits, axis=-1)
+    
+    # 计算准确率
+    acc = accuracy_score(labels, predictions)
+    
+    return {
+        "accuracy": acc
+    }
+
+
 def main():
     # =================Configuration=================
     model_name_or_path = "./instructblip-vicuna-7b" 
@@ -184,7 +241,7 @@ def main():
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "lora_dropout": 0.05,
-            "modules_to_save": ["embed_tokens", "lm_head"]
+            "modules_to_save": ["embed_tokens", "lm_head","score_head"]
         }
     )
     
@@ -208,7 +265,7 @@ def main():
     config.current_token_id = current_token_id
 
     # 加载基础模型
-    model = InstructBlipMultiTask.from_pretrained(
+    model = RvlnMultiTask.from_pretrained(
         model_name_or_path,
         config=config,
         torch_dtype=torch.float16
@@ -241,13 +298,11 @@ def main():
     peft_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
-        # 针对 Vicuna/Llama 的所有线性层
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
-        # ⚠️ 关键：因为加了新 token，必须训练 Embedding 层和 Head
-        modules_to_save=["embed_tokens", "lm_head"] 
+        modules_to_save=["embed_tokens", "lm_head","score_head"] 
     )
     
     print("Applying LoRA to LLM...")
@@ -298,13 +353,9 @@ def main():
         deepspeed="./ds_config_zero2.json",
         remove_unused_columns=False,
         report_to="none",
-        
-        # --- [新增] 验证集相关配置 ---
         evaluation_strategy="steps",   # 按步数评估 (也可以选 "epoch")
         eval_steps=1000,                # 每 100 步评估一次验证集 (根据你总步数调整)
         per_device_eval_batch_size=batch_size, # 验证集的 Batch Size
-        
-        # --- [新增] 模型保存策略 (Save Best) ---
         save_strategy="steps",         # 必须和 evaluation_strategy 一致
         save_steps=2000,                # 每 2000 步尝试保存
         save_total_limit=2,            # 最多保留 2 个 checkpoint，省硬盘
@@ -315,15 +366,14 @@ def main():
     )
 
     # 使用自定义 Trainer
-    trainer = WeightedTrainer(
+    trainer = ClassificationTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=collator,
         processing_class=tokenizer,
-        # ================= [SwanLab] 3. 添加 Callback =================
-        # SwanLabCallback 会自动记录 Loss, LR, Epoch 等信息
+        compute_metrics=compute_metrics,
         callbacks=[SwanLabCallback()]
     )
 

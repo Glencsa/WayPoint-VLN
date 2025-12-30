@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from transformers import (
     InstructBlipForConditionalGeneration, 
     InstructBlipConfig, 
-    ViTModel # <--- 引入 ViTModel 作为深度图编码器
+    ViTModel
 )
 
 class DepthCrossAttentionFusion(nn.Module):
@@ -70,7 +70,7 @@ class DepthCrossAttentionFusion(nn.Module):
 
     
 
-class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
+class RvlnMultiTask(InstructBlipForConditionalGeneration):
     def __init__(self, config: InstructBlipConfig):
         super().__init__(config)
         # 检查 Config
@@ -79,7 +79,6 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         if not hasattr(config, 'current_token_id') or config.current_token_id is None:
             raise ValueError("Config must contain 'current_token_id'")
         
-        # === 加载标准 ViT 作为深度编码器 (替代原来的 Estimator) ===
         # 我们使用 ImageNet 预训练的 ViT-Base 来提取深度图特征
         depth_encoder_name = "./vit-base-patch16-224"
         print(f"Loading Depth Encoder: {depth_encoder_name}...")
@@ -108,6 +107,16 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
             nn.ReLU(),
             nn.Linear(512, 2) 
         )
+        llm_hidden_size = self.language_model.config.hidden_size
+        self.score_head = nn.Sequential(
+            nn.Linear(llm_hidden_size, llm_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(llm_hidden_size, 10) # 输出 10 个 logits
+        )
+        
+        # 初始化分类头
+        self._init_weights(self.score_head)
         self._init_weights(self.itm_head)
 
     def _init_weights(self, module):
@@ -247,12 +256,12 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
     def forward(
             self,
             pixel_values: torch.FloatTensor,
-            depth_pixel_values: torch.FloatTensor, # <--- 新增参数
+            depth_pixel_values: torch.FloatTensor,
             qformer_input_ids: torch.LongTensor,
             qformer_attention_mask: torch.LongTensor,
             input_ids: torch.LongTensor,
             attention_mask: torch.LongTensor = None,
-            labels: torch.LongTensor = None,
+            class_labels: torch.LongTensor = None,
             **kwargs
         ):
             # 1. 传入 depth_pixel_values
@@ -274,13 +283,32 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
             if attention_mask is None:
                 attention_mask = torch.ones(input_ids.shape, device=input_ids.device)
 
-            return self.language_model(
+            outputs = self.language_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                labels=labels,
-                return_dict=True,
-                **kwargs
+                output_hidden_states=True,
+                return_dict=True
             )
+            
+            
+            # 严谨做法：根据 attention_mask 找最后一个非 pad 的 token
+            last_hidden_state = outputs.hidden_states[-1]
+            batch_size = last_hidden_state.shape[0]
+            sequence_lengths = (torch.eq(attention_mask, 1)).sum(1) - 1
+            pooled_output = last_hidden_state[torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
+
+            # 5. 分类 logits
+            logits = self.score_head(pooled_output) # [B, 10]
+
+            loss = None
+            if class_labels is not None:
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits, class_labels)
+
+            return {
+                "loss": loss,
+                "logits": logits
+            }
 
     @torch.no_grad()
     def generate(

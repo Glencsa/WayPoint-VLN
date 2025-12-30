@@ -7,7 +7,7 @@ import numpy as np
 import cv2
 
 from models.depth_estimate import DepthEstimator
-from models.rvln import InstructBlipMultiTask
+from models.rvln import RvlnMultiTask
 from transformers import (
     InstructBlipProcessor,
     BertTokenizer,
@@ -51,7 +51,7 @@ def run_inference():
     qformer_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     estimator = DepthEstimator(model_id="./Depth-Anything-V2-Small-hf", device=DEVICE)
     
-    model = InstructBlipMultiTask.from_pretrained(
+    model = RvlnMultiTask.from_pretrained(
         MODEL_ID, 
         config=config,
         torch_dtype=DTYPE

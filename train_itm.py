@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 from transformers import InstructBlipProcessor, BertTokenizer,InstructBlipConfig
 from transformers import AutoTokenizer
-from models.rvln import InstructBlipMultiTask 
+from models.rvln import RvlnMultiTask 
 from models.depth_estimate import DepthEstimator
 import swanlab
 
@@ -208,7 +208,7 @@ if __name__ == "__main__":
     qformer_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
     print("Loading Dual-Tower Model...")
-    model = InstructBlipMultiTask.from_pretrained(
+    model = RvlnMultiTask.from_pretrained(
         MODEL_NAME,
         config=config,              
         torch_dtype=torch.bfloat16, 

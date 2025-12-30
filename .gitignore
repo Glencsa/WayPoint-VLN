@@ -57,3 +57,4 @@ output/
 datasets/
 checkpoint/
 dataset_waypoint/
+logs/
