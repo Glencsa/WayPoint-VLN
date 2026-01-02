@@ -2,6 +2,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import numpy as np 
+import torch.nn.functional as F
 from torch.utils.data import random_split
 from transformers import (
     InstructBlipProcessor,
@@ -159,48 +161,105 @@ class ClassificationTrainer(CustomTrainer):
         self.acc_buffer = []
         self.last_eval_visual_step = -1
 
+    def generate_gaussian_target(self, labels, num_classes, sigma=1.0):
+        """
+        生成高斯软标签
+        labels: [Batch_Size] 真实的类别索引
+        num_classes: 总类别数
+        sigma: 高斯分布的标准差，控制"宽容度"。Sigma越大，允许的误差范围越宽。
+        """
+        device = labels.device
+        batch_size = labels.size(0)
+        
+        # 1. 创建所有类别的索引 [1, num_classes] -> [Batch, num_classes]
+        # 这里假设 Index 0 是 Stop，不参与距离计算，所以我们只处理 1~N
+        # 如果你的类别定义不同，请相应调整
+        range_tensor = torch.arange(num_classes, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # 2. 扩展标签维度 [Batch, 1]
+        target_tensor = labels.unsqueeze(1)
+        
+        # 3. 计算距离 (绝对值距离)
+        # distance: [Batch, Num_Classes]
+        distance = torch.abs(range_tensor - target_tensor)
+        
+        # --- 进阶：如果是全景图(0和8是相邻的)，可以使用环形距离 ---
+        # distance = torch.min(distance, num_classes - 1 - distance) # 仅当首尾相接时开启
+        
+        # 4. 生成高斯分布
+        # exp(- dist^2 / (2 * sigma^2))
+        scores = torch.exp(- (distance.float() ** 2) / (2 * sigma ** 2))
+        
+        # 5. 特殊处理 Stop 标签 (Index 0)
+        # 假设 Index 0 是 "Stop/停"，它不应该和 "Index 1 (方向0)" 相近
+        # 逻辑：
+        # - 如果真实标签是 0: 目标就是 One-hot [1, 0, 0...]
+        # - 如果真实标签是 >0: 目标是在 1~N 之间的高斯分布，且 Index 0 的概率设为 0
+        
+        # 创建一个 mask，标记哪些样本的 GT 是 0
+        is_stop_token = (labels == 0) # [Batch]
+        
+        # 对于 GT != 0 的样本，把 Index 0 的概率强制设为 0 (或者极小值)
+        scores[:, 0] = 0.0
+        
+        # 6. 归一化 (让概率和为 1)
+        # 加上 epsilon 防止除零
+        probs = scores / (scores.sum(dim=1, keepdim=True) + 1e-9)
+        
+        # 7. 对于 GT == 0 的样本，强制恢复为 Hard Label [1, 0, 0, ...]
+        # 构造 One-hot
+        one_hot = torch.zeros_like(probs)
+        one_hot.scatter_(1, target_tensor, 1.0)
+        
+        # 组合：如果是 Stop 则用 One-hot，否则用高斯分布
+        final_targets = torch.where(is_stop_token.unsqueeze(1), one_hot, probs)
+        
+        return final_targets
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        Loss 计算 + 准确率累积模拟大 Batch
+        Loss 计算 (高斯软标签版) + 准确率累积
         """
-        # 1. 获取标签
         labels = inputs.get("class_labels")
         if labels is None:
-            labels = inputs.get("labels") 
+            labels = inputs.get("labels")
             
-        # 2. 前向传播
         outputs = model(**inputs)
-        logits = outputs.get("logits")
+        logits = outputs.get("logits") # [Batch, Num_Classes]
         
-        # 3. 计算 Loss
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(logits, labels)
+        loss = None
+        if logits is not None:
+            # --- 核心修改：使用 Soft Target Cross Entropy ---
+            
+            # 1. 生成软标签目标
+            # sigma=1.0 表示相邻的 1 个单位 Loss 也很小
+            # sigma=0.5 表示要求比较严格
+            # sigma=2.0 表示非常宽容
+            num_classes = logits.size(-1)
+            soft_targets = self.generate_gaussian_target(labels, num_classes, sigma=1.5)
+            
+            # 2. 计算 Loss
+            # CrossEntropyLoss(pred, soft_target) 等价于 -sum(target * log_softmax(pred))
+            log_probs = F.log_softmax(logits, dim=-1)
+            
+            # 样本维度的 Loss: [Batch]
+            # 公式: KL Divergence (忽略常数项) -> Cross Entropy
+            loss_per_sample = -torch.sum(soft_targets * log_probs, dim=-1)
+            loss = loss_per_sample.mean()
 
-        # 4. 计算准确率并累积
+        # 4. 计算准确率 (保持不变，准确率还是看硬指标)
         if logits is not None:
             with torch.no_grad():
                 preds = torch.argmax(logits, dim=-1)
-                
-                # --- A. 计算当前这 2 张图的准确率 ---
                 micro_acc = (preds == labels).float().mean().item()
                 
-                # --- B. 存入缓存 ---
-                # 只有在训练模式下才累积
                 if model.training:
                     self.acc_buffer.append(micro_acc)
-                    
-                    # --- C. 检查是否存够了 (模拟大 Batch) ---
-                    # self.args.gradient_accumulation_steps 就是你设置的 8
                     if len(self.acc_buffer) >= self.args.gradient_accumulation_steps:
-                        
-                        # 算平均值 (这就是大 Batch 的准确率)
                         avg_acc = sum(self.acc_buffer) / len(self.acc_buffer)
-                        
-                        # 记录到日志
                         self.log({"train/accuracy": avg_acc})
-                        
-                        # 清空缓存，准备下一轮累积
                         self.acc_buffer = []
+
         self._handle_visualization(model, inputs, preds, labels)
         return (loss, outputs) if return_outputs else loss
     def _handle_visualization(self, model, inputs, preds, labels):
@@ -283,7 +342,7 @@ def compute_metrics(eval_pred):
     predictions = np.argmax(logits, axis=-1)
     
     # 计算准确率
-    acc = accuracy_score(labels, predictions)
+    acc = (predictions == labels).mean()
     
     return {
         "accuracy": acc
