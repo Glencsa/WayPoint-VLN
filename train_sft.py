@@ -480,8 +480,6 @@ def main():
         metric_for_best_model="loss",  # 以 loss 为标准 (loss 越小越好)
         greater_is_better=False,       # loss 是越小越好，所以是 False
         logging_steps=4,
-        remove_unused_columns=False,
-        label_names=["labels"],
     )
 
     # 使用自定义 Trainer
