@@ -1,8 +1,8 @@
 import json
 import os
-import re
 import torch
 from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 from PIL import Image
 
 class RvlnLoRADataset(Dataset):
@@ -56,11 +56,9 @@ class RvlnLoRADataset(Dataset):
         rgb_images = [load_image(p) for p in rgb_paths]
         depth_images = [load_image(p) for p in depth_paths]
 
-        # ================= 3. 生成 Q-Former 输入 (修复 inputs 未定义问题) =================
+        # ================= 3. 生成 Q-Former 输入 =================
         human_input = item["conversations"][0]["value"]
         
-        # Processor 同时处理图片和文本，生成 Q-Former 需要的所有特征
-        # 这里 text 参数用于生成 qformer_input_ids
         inputs = self.processor(
             images=rgb_images,
             text=[human_input], 
@@ -70,10 +68,9 @@ class RvlnLoRADataset(Dataset):
             max_length=512
         )
         
-        # 单独处理深度图
         depth_inputs = self.processor(images=depth_images, return_tensors="pt")
 
-        # ================= 4. LLM 输入处理 (分类模式) =================
+        # ================= 4. LLM 输入处理 (生成式模式) =================
         # Token 扩展：为视觉特征预留位置
         hist_replacement = self.hist_token * (self.history_len * self.query_tokens)
         curr_replacement = self.curr_token * (self.current_len * self.query_tokens)
@@ -84,36 +81,20 @@ class RvlnLoRADataset(Dataset):
             self.curr_token, curr_replacement
         )
         
-        # 构造 LLM Prompt (注意：分类任务不需要把 GPT 回复拼接到这里)
+        # 构造 LLM Prompt
         llm_prompt = f"USER: {expanded_human_input} ASSISTANT:"
-
-        # ================= 5. 提取分类标签 (Label Parsing) =================
-        gpt_response = item["conversations"][1]["value"]
-        # 目标是从 "{'Route': 8}" 中提取 8
-        try:
-            # 正则提取数字 (-1 到 8)
-            match = re.search(r"(-?\d+)", gpt_response)
-            if match:
-                route_val = int(match.group(1))
-            else:
-                # 没找到数字，默认设为 -1 (Stop) 对应的索引
-                route_val = -1
-        except:
-            route_val = -1
-            
-        # 映射逻辑: Route -1 -> Class 0, Route 0 -> Class 1, ..., Route 8 -> Class 9
-        class_label = route_val + 1 
         
-        # 安全限制，防止越界 (0-9)
-        class_label = max(0, min(9, class_label))
+        # 获取原始文本回复 (例如: "{'Route': 8}")
+        # 不再提取数字，而是直接学习生成这段文本
+        gpt_response = item["conversations"][1]["value"]
 
         return {
             "pixel_values": inputs.pixel_values,         # [N, 3, H, W]
             "depth_pixel_values": depth_inputs.pixel_values, # [N, 3, H, W]
             "qformer_input_ids": inputs.qformer_input_ids[0],
             "qformer_attention_mask": inputs.qformer_attention_mask[0],
-            "llm_prompt": llm_prompt,                        # 字符串，交给 Collator 去 Tokenize
-            "class_labels": class_label                      # 整数
+            "llm_prompt": llm_prompt,     # 提问部分
+            "llm_answer": gpt_response    # 回答部分
         }
 
 class DataCollatorForRvln:
@@ -125,38 +106,56 @@ class DataCollatorForRvln:
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
     def __call__(self, batch):
-        # 1. 堆叠图像 [Batch, 5, 3, 224, 224]
+        # 1. 堆叠图像
         pixel_values_rgb = torch.stack([item["pixel_values"] for item in batch])
         pixel_values_depth = torch.stack([item["depth_pixel_values"] for item in batch])
         
-        # 2. 堆叠 Q-Former Input (Dataset 里已经做了 Padding，直接 Stack)
+        # 2. 堆叠 Q-Former Input
         qformer_input_ids = torch.stack([item["qformer_input_ids"] for item in batch])
         qformer_attention_mask = torch.stack([item["qformer_attention_mask"] for item in batch])
         
-        # 3. 处理 LLM 输入 (Tokenize & Dynamic Padding)
-        llm_prompts = [item["llm_prompt"] for item in batch]
+        # ================= 3. 处理 LLM 输入 (拼接 Prompt + Answer) =================
+        input_ids_list = []
+        labels_list = []
         
-        llm_inputs = self.tokenizer(
-            llm_prompts,
-            padding=True,
-            return_tensors="pt",
-            truncation=True,
-            max_length=2048, # 预留给 visual tokens
-            add_special_tokens=False # Prompt 里已经手动加了 USER/ASSISTANT
-        )
+        for item in batch:
+            prompt = item["llm_prompt"]
+            answer = item["llm_answer"]
+            
+            # 分别 Tokenize 提示词和答案
+            # add_special_tokens=False 是为了精准控制 Mask 边界
+            prompt_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids
+            answer_ids = self.tokenizer(answer, add_special_tokens=False).input_ids
+            
+            # 拼接: [BOS] + Prompt + Answer + [EOS]
+            # 注意：某些 Tokenizer 需要手动加 BOS，有些不需要，视具体模型而定
+            # 这里演示最通用的拼接方式
+            
+            input_ids = prompt_ids + answer_ids + [self.tokenizer.eos_token_id]
+            
+            # 构建 Labels: Prompt 部分设为 -100 (不计算 Loss)，Answer 部分保留
+            labels = [-100] * len(prompt_ids) + answer_ids + [self.tokenizer.eos_token_id]
+            
+            # 转换为 Tensor
+            input_ids_list.append(torch.tensor(input_ids, dtype=torch.long))
+            labels_list.append(torch.tensor(labels, dtype=torch.long))
         
-        input_ids = llm_inputs.input_ids
-        attention_mask = llm_inputs.attention_mask
+        # 4. 动态 Padding
+        # input_ids 使用 pad_token_id 填充
+        input_ids_padded = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
         
-        # 4. 处理分类标签
-        class_labels = torch.tensor([item["class_labels"] for item in batch], dtype=torch.long)
+        # labels 使用 -100 填充 (CrossEntropyLoss 的 ignore_index)
+        labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=-100)
+        
+        # 5. 生成 Attention Mask (非 padding 部分为 1)
+        attention_mask = input_ids_padded.ne(self.pad_token_id).long()
 
         return {
-            "pixel_values": pixel_values_rgb,            # 适配模型参数名
-            "depth_pixel_values": pixel_values_depth,    # 适配模型参数名
+            "pixel_values": pixel_values_rgb,
+            "depth_pixel_values": pixel_values_depth,
             "qformer_input_ids": qformer_input_ids,
             "qformer_attention_mask": qformer_attention_mask,
-            "input_ids": input_ids,
+            "input_ids": input_ids_padded,
             "attention_mask": attention_mask,
-            "class_labels": class_labels                 # 传入 forward 计算 CrossEntropyLoss
+            "labels": labels_padded  # 标准的 Causal LM labels
         }
