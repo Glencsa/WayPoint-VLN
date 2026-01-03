@@ -108,15 +108,15 @@ class InstructBlipLoRADataset(Dataset):
         class_label = max(0, min(9, class_label))
 
         return {
-            "pixel_values_rgb": inputs.pixel_values,         # [N, 3, H, W]
-            "pixel_values_depth": depth_inputs.pixel_values, # [N, 3, H, W]
+            "pixel_values": inputs.pixel_values,         # [N, 3, H, W]
+            "depth_pixel_values": depth_inputs.pixel_values, # [N, 3, H, W]
             "qformer_input_ids": inputs.qformer_input_ids[0],
             "qformer_attention_mask": inputs.qformer_attention_mask[0],
             "llm_prompt": llm_prompt,                        # 字符串，交给 Collator 去 Tokenize
             "class_labels": class_label                      # 整数
         }
 
-class DataCollatorForInstructBlip:
+class DataCollatorForRvln:
     def __init__(self, processor, tokenizer, qformer_tokenizer):
         self.processor = processor
         self.tokenizer = tokenizer

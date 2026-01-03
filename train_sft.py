@@ -27,7 +27,7 @@ from swanlab.integration.huggingface import SwanLabCallback
 # 引入你的自定义模块
 from models.rvln import RvlnMultiTask 
 # 引入你上面提供的 Dataset 和 Collator 类
-from data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip 
+from data_utils import InstructBlipLoRADataset, DataCollatorForRvln
 
 def print_trainable_parameters(model):
     """打印可训练参数统计"""
@@ -46,23 +46,6 @@ def print_trainable_parameters(model):
 # ==========================================
 # 2. 修正 Data Collator 以匹配模型输入
 # ==========================================
-class DataCollatorWrapper(DataCollatorForInstructBlip):
-    """
-    包装你原本的 Collator，将输出的键名修改为模型 forward 函数需要的名字
-    pixel_values_rgb -> pixel_values
-    pixel_values_depth -> depth_pixel_values
-    """
-    def __call__(self, batch):
-        outputs = super().__call__(batch)
-        
-        # 重命名键值以匹配 RvlnMultiTask.forward 的参数
-        if "pixel_values_rgb" in outputs:
-            outputs["pixel_values"] = outputs.pop("pixel_values_rgb")
-        
-        if "pixel_values_depth" in outputs:
-            outputs["depth_pixel_values"] = outputs.pop("pixel_values_depth")
-            
-        return outputs
 
 # ==========================================
 # 3. 自定义 Trainer (确保保存 Embeddings)
@@ -479,8 +462,8 @@ def main():
         [train_size, val_size],
         generator=torch.Generator().manual_seed(42) 
     )
-    
-    collator = DataCollatorWrapper(
+
+    collator = DataCollatorForRvln(
         processor=processor,
         tokenizer=tokenizer,
         qformer_tokenizer=qformer_tokenizer
