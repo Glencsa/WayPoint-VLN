@@ -5,6 +5,7 @@ import torch.distributed as dist
 import numpy as np 
 import torch.nn.functional as F
 from torch.utils.data import random_split
+import swanlab
 from transformers import (
     InstructBlipProcessor,
     InstructBlipConfig,
@@ -17,35 +18,10 @@ from peft import (
     get_peft_model,
     TaskType
 )
-
-# ==========================================
-# [SwanLab] 1. 引入 SwanLab 和 HF 回调
-# ==========================================
-import swanlab
 from swanlab.integration.huggingface import SwanLabCallback
-
-# 引入你的自定义模块
 from models.rvln import RvlnMultiTask 
-# 引入你上面提供的 Dataset 和 Collator 类
-from data_utils import InstructBlipLoRADataset, DataCollatorForRvln
-
-def print_trainable_parameters(model):
-    """打印可训练参数统计"""
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || all params: {all_param} || "
-        f"trainable%: {100 * trainable_params / all_param:.2f}"
-    )
-
-
-# ==========================================
-# 2. 修正 Data Collator 以匹配模型输入
-# ==========================================
+from data_utils import RvlnLoRADataset, DataCollatorForRvln
+from utils import *
 
 # ==========================================
 # 3. 自定义 Trainer (确保保存 Embeddings)
@@ -64,7 +40,7 @@ class CustomTrainer(Trainer):
         if self.is_world_process_zero():
             self.tokenizer.save_pretrained(output_dir)
             
-            print(f"✅ Model (LoRA + Embeddings) saved to {output_dir}")
+            print(f"Model (LoRA + Embeddings) saved to {output_dir}")
 
 class WeightedTrainer(CustomTrainer):
     def __init__(self, *args, **kwargs):
@@ -135,7 +111,6 @@ class WeightedTrainer(CustomTrainer):
             final_loss = weighted_loss.sum()
 
         return (final_loss, outputs) if return_outputs else final_loss
-
 
 
 class ClassificationTrainer(CustomTrainer):
@@ -316,31 +291,14 @@ class ClassificationTrainer(CustomTrainer):
         return img
 
 
-def compute_metrics(eval_pred):
-    """
-    专门用于 Trainer 评估验证集时的回调函数
-    """
-    logits, labels = eval_pred
-    # logits 是 numpy 数组，需要取 argmax
-    predictions = np.argmax(logits, axis=-1)
-    
-    # 计算准确率
-    acc = (predictions == labels).mean()
-    
-    return {
-        "accuracy": acc
-    }
-
 
 def main():
     # =================Configuration=================
     model_name_or_path = "./instructblip-vicuna-7b" 
-    # 之前训练好的 Stage 1 权重路径 (包含 Fusion, Q-Former, Depth 等)
+    # Weight: Fusion, Q-Former, Depth
     stage1_checkpoint = "checkpoint/latest_checkpoint.pth"
-    
     data_path = "dataset_waypoint/rgb_images_r2r_train_processed.json"
     output_dir = "./output/rvln_sft_llm"
-    
     # 训练参数
     batch_size = 2
     grad_accumulation = 8 # 稍微加大累积，模拟更大 batch
@@ -352,9 +310,9 @@ def main():
     # ================= [SwanLab] 2. 初始化 SwanLab =================
     # 在这里定义实验名称和需要记录的配置信息
     swanlab.init(
-        project="InstructBlip-LoRA-SFT",
+        project="Rvln-LoRA-SFT",
         experiment_name="vicuna-7b-lora-stage2",
-        description="InstructBlip Stage 2 SFT with LoRA monitoring",
+        description="Rvln Stage 2 SFT with LoRA monitoring",
         config={
             "model_name": model_name_or_path,
             "stage1_checkpoint": stage1_checkpoint,
@@ -439,7 +397,7 @@ def main():
 
 # ================= 5. Data Setup (关键修改：划分验证集) =================
     print("Loading Full Dataset...")
-    full_dataset = InstructBlipLoRADataset(
+    full_dataset = RvlnLoRADataset(
         data_path=data_path,
         processor=processor,
         tokenizer=tokenizer,
@@ -448,14 +406,12 @@ def main():
         current_len=1
     )
     
-    # [新增] 计算划分数量
     val_ratio = 0.01  # 1% 做验证，99% 训练
     val_size = int(len(full_dataset) * val_ratio)
     train_size = len(full_dataset) - val_size
     
     print(f"Splitting Dataset: Total={len(full_dataset)} | Train={train_size} | Val={val_size}")
     
-    # [新增] 随机切分
     # generator用于固定随机种子，保证每次切分一样，方便复现
     train_dataset, eval_dataset = random_split(
         full_dataset, 

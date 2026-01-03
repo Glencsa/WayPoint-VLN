@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 
-class InstructBlipLoRADataset(Dataset):
+class RvlnLoRADataset(Dataset):
     def __init__(self, data_path, processor, tokenizer, image_root=".", history_len=4, current_len=1, query_tokens=32):
         print(f"正在加载 JSON文件: {data_path}")
         with open(data_path, "r", encoding='utf-8') as f:
