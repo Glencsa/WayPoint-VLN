@@ -5,7 +5,6 @@ import torch.distributed as dist
 import numpy as np 
 import torch.nn.functional as F
 from torch.utils.data import random_split
-import swanlab
 from transformers import (
     InstructBlipProcessor,
     InstructBlipConfig,
@@ -18,7 +17,6 @@ from peft import (
     get_peft_model,
     TaskType
 )
-from swanlab.integration.huggingface import SwanLabCallback
 from models.rvln import RvlnMultiTask 
 from data_utils import RvlnLoRADataset, DataCollatorForRvln
 from utils import *
@@ -53,18 +51,9 @@ class WeightedTrainer(CustomTrainer):
         # 包括 -1 和 0-8
         target_strings = [str(i) for i in range(9)] + ["-1", "-"] 
         
-        # 遍历词表，找到所有可能的编码形式（例如 "8", " 8", "##8" 等）
-        # 注意：这种方式比 convert_tokens_to_ids 更稳健，能处理 SentencePiece 的下划线前缀等情况
+        # 遍历词表，找到所有可能的编码形式
         vocab = self.tokenizer.get_vocab()
         
-        for token_str, token_id in vocab.items():
-            # 这里需要根据你的 Tokenizer 实际情况调整
-            # 很多 Tokenizer (如 Llama/T5) 会在词前加 " " 或 " "
-            # 我们简单粗暴地检查 token 文本是否包含数字
-            
-            # 简化逻辑：直接添加明确的 ID
-            pass 
-
         # 推荐：直接精准添加 ID (以 Llama/Qwen 等常用 Tokenizer 为例)
         # 1. 纯数字
         for i in range(9):
@@ -74,8 +63,6 @@ class WeightedTrainer(CustomTrainer):
             self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(" " + str(i)))
         
         # 2. 处理负号 (对于 -1)
-        # 通常 "-1" 会被拆分为 ["-", "1"]。我们只能给 "-" 加权，或者给 "1" 加权。
-        # 给 "-" 加权可能会影响所有负数，但如果是导航场景通常是可以接受的。
         self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids("-"))
         self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(" -"))
 
@@ -96,47 +83,33 @@ class WeightedTrainer(CustomTrainer):
         labels = inputs.get("labels")
         
         # 2. 前向传播
-        # model(**inputs) 调用的是我们修改后的 forward，它不计算 loss
         outputs = model(**inputs)
         logits = outputs.get("logits")
 
         # 3. 移位 (Shift) 操作 - 核心步骤
-        # Causal LM 中，logits[i] 预测的是 labels[i+1]
-        # 所以我们需要去掉 logits 的最后一个，去掉 labels 的第一个
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
         # 4. 展平 (Flatten) 以便计算 CrossEntropy
-        # view(-1, vocab_size) 将 (batch, seq, vocab) -> (batch*seq, vocab)
         batch_size, seq_len, vocab_size = shift_logits.shape
         flat_logits = shift_logits.view(-1, vocab_size)
         flat_labels = shift_labels.view(-1)
 
         # 5. 计算未缩减 (Reduction='none') 的 Loss
-        # 这样我们会得到形状为 (batch*seq, ) 的 loss 向量
         loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
         token_losses = loss_fct(flat_logits, flat_labels)
 
         # 6. 构建权重矩阵
-        # 默认权重为 1.0
         weights = torch.ones_like(token_losses)
         
         # 7. 识别目标 Token 并加权
-        # flat_labels 中包含真实的 token id
-        # 我们创建一个 mask，标记出所有属于 target_token_ids 的位置
-        
-        # 方法 A: 循环判断 (简单易懂，但在 GPU 上做循环效率略低，不过 token 种类少时没问题)
         for target_id in self.target_token_ids:
-            # 找到 label 等于 目标数字 的位置
             weights[flat_labels == target_id] = self.key_token_weight
             
         # 8. 应用权重
         weighted_loss = token_losses * weights
 
         # 9. 计算最终平均 Loss
-        # 注意：分母应该是有效 Token 的数量 (即 label != -100 的数量)，而不是所有 Token
-        # CrossEntropyLoss 已经处理了 ignore_index 对应的 loss 为 0，但我们需要正确处理分母
-        
         active_elements = (flat_labels != -100).sum()
         
         if active_elements > 0:
@@ -151,59 +124,29 @@ class ClassificationTrainer(CustomTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.acc_buffer = []
-        self.last_eval_visual_step = -1
+        # [已移除] self.last_eval_visual_step = -1
 
     def generate_gaussian_target(self, labels, num_classes, sigma=1.0):
         """
         生成高斯软标签
-        labels: [Batch_Size] 真实的类别索引
-        num_classes: 总类别数
-        sigma: 高斯分布的标准差，控制"宽容度"。Sigma越大，允许的误差范围越宽。
         """
         device = labels.device
         batch_size = labels.size(0)
         
-        # 1. 创建所有类别的索引 [1, num_classes] -> [Batch, num_classes]
-        # 这里假设 Index 0 是 Stop，不参与距离计算，所以我们只处理 1~N
-        # 如果你的类别定义不同，请相应调整
         range_tensor = torch.arange(num_classes, device=device).unsqueeze(0).expand(batch_size, -1)
-        
-        # 2. 扩展标签维度 [Batch, 1]
         target_tensor = labels.unsqueeze(1)
         
-        # 3. 计算距离 (绝对值距离)
-        # distance: [Batch, Num_Classes]
         distance = torch.abs(range_tensor - target_tensor)
-        
-        # --- 进阶：如果是全景图(0和8是相邻的)，可以使用环形距离 ---
-        # distance = torch.min(distance, num_classes - 1 - distance) # 仅当首尾相接时开启
-        
-        # 4. 生成高斯分布
-        # exp(- dist^2 / (2 * sigma^2))
         scores = torch.exp(- (distance.float() ** 2) / (2 * sigma ** 2))
         
-        # 5. 特殊处理 Stop 标签 (Index 0)
-        # 假设 Index 0 是 "Stop/停"，它不应该和 "Index 1 (方向0)" 相近
-        # 逻辑：
-        # - 如果真实标签是 0: 目标就是 One-hot [1, 0, 0...]
-        # - 如果真实标签是 >0: 目标是在 1~N 之间的高斯分布，且 Index 0 的概率设为 0
-        
-        # 创建一个 mask，标记哪些样本的 GT 是 0
         is_stop_token = (labels == 0) # [Batch]
-        
-        # 对于 GT != 0 的样本，把 Index 0 的概率强制设为 0 (或者极小值)
         scores[:, 0] = 0.0
         
-        # 6. 归一化 (让概率和为 1)
-        # 加上 epsilon 防止除零
         probs = scores / (scores.sum(dim=1, keepdim=True) + 1e-9)
         
-        # 7. 对于 GT == 0 的样本，强制恢复为 Hard Label [1, 0, 0, ...]
-        # 构造 One-hot
         one_hot = torch.zeros_like(probs)
         one_hot.scatter_(1, target_tensor, 1.0)
         
-        # 组合：如果是 Stop 则用 One-hot，否则用高斯分布
         final_targets = torch.where(is_stop_token.unsqueeze(1), one_hot, probs)
         
         return final_targets
@@ -222,20 +165,11 @@ class ClassificationTrainer(CustomTrainer):
         loss = None
         if logits is not None:
             # --- 核心修改：使用 Soft Target Cross Entropy ---
-            
-            # 1. 生成软标签目标
-            # sigma=1.0 表示相邻的 1 个单位 Loss 也很小
-            # sigma=0.5 表示要求比较严格
-            # sigma=2.0 表示非常宽容
             num_classes = logits.size(-1)
             soft_targets = self.generate_gaussian_target(labels, num_classes, sigma=1.5)
             
-            # 2. 计算 Loss
-            # CrossEntropyLoss(pred, soft_target) 等价于 -sum(target * log_softmax(pred))
             log_probs = F.log_softmax(logits, dim=-1)
             
-            # 样本维度的 Loss: [Batch]
-            # 公式: KL Divergence (忽略常数项) -> Cross Entropy
             loss_per_sample = -torch.sum(soft_targets * log_probs, dim=-1)
             loss = loss_per_sample.mean()
 
@@ -252,116 +186,32 @@ class ClassificationTrainer(CustomTrainer):
                         self.log({"train/accuracy": avg_acc})
                         self.acc_buffer = []
 
-        self._handle_visualization(model, inputs, preds, labels)
+        # [已移除] 可视化相关调用 self._handle_visualization(model, inputs, preds, labels)
         return (loss, outputs) if return_outputs else loss
-    def _handle_visualization(self, model, inputs, preds, labels):
-        """
-        控制何时截图并上传到 SwanLab
-        """
-        current_step = self.state.global_step
 
-        # 情况 1: 正在训练 (Training)
-        # 每 50 步记录一次训练集的图
-        if model.training:
-            if self.is_world_process_zero() and current_step % 50 == 0:
-                self._log_visuals(inputs, preds, labels, prefix="Train")
-
-        # 情况 2: 正在验证 (Evaluation)
-        # model.training 为 False
-        else:
-            # 只有在主进程，且当前这一轮 Eval 还没记录过图片时，才记录
-            # (Trainer 在 Eval 过程中 global_step 是不会变的)
-            if self.is_world_process_zero() and self.last_eval_visual_step != current_step:
-                self._log_visuals(inputs, preds, labels, prefix="Eval")
-                # 标记这一轮已经记录过了
-                self.last_eval_visual_step = current_step
-
-    def _log_visuals(self, inputs, preds, labels, prefix="Train"):
-        """
-        执行具体的上传操作
-        prefix: 用于区分是 'Train' 还是 'Eval'
-        """
-        try:
-            idx = 0 # 取 Batch 第一张图
-            
-            # 1. 还原文本
-            instruction_text = self.processing_class.decode(
-                inputs["input_ids"][idx], 
-                skip_special_tokens=True
-            )
-            display_text = instruction_text[:100] + "..." if len(instruction_text) > 100 else instruction_text
-
-            # 2. 还原图片
-            # [Batch, 5, 3, H, W] -> 取最后一帧 -> [3, H, W]
-            rgb_tensor = inputs["pixel_values"][idx][-1] 
-            rgb_img = self._tensor_to_pil(rgb_tensor)
-
-            depth_tensor = inputs["depth_pixel_values"][idx][-1]
-            depth_img = self._tensor_to_pil(depth_tensor, is_depth=True)
-
-            # 3. 构建 Caption
-            pred_val = preds[idx].item() - 1  # 还原回 -1~8
-            gt_val = labels[idx].item() - 1
-            status = "✅" if pred_val == gt_val else "❌"
-            
-            caption = (f"[{prefix}] {status} Pred: {pred_val} | GT: {gt_val}\n"
-                       f"{display_text}")
-
-            # 4. 发送 SwanLab (使用 prefix 分组)
-            swanlab.log({
-                f"Visual/{prefix}_RGB": swanlab.Image(rgb_img, caption=caption),
-                f"Visual/{prefix}_Depth": swanlab.Image(depth_img, caption="Depth Map")
-            })
-            
-        except Exception as e:
-            print(f"SwanLab Visual Error: {e}")
-
-    def _tensor_to_pil(self, tensor, is_depth=False):
-        """反归一化并转 PIL"""
-        img = tensor.cpu().numpy().transpose(1, 2, 0)
-        img = img - img.min()
-        img = img / (img.max() + 1e-6)
-        img = (img * 255).astype(np.uint8)
-        return img
-
+    # [已移除] def _handle_visualization(self, model, inputs, preds, labels): ...
+    # [已移除] def _log_visuals(self, inputs, preds, labels, prefix="Train"): ...
+    # [已移除] def _tensor_to_pil(self, tensor, is_depth=False): ...
 
 
 def main():
     # =================Configuration=================
     model_name_or_path = "./instructblip-vicuna-7b" 
     # Weight: Fusion, Q-Former, Depth
-    stage1_checkpoint = "checkpoint/latest_checkpoint.pth"
-    data_path = "dataset_waypoint/rgb_images_r2r_train_processed.json"
+    stage1_checkpoint = "checkpoints/latest_checkpoint.pth"
+    data_path = "/home/guanbin/scratch/dataset/r2r_dataset/rgb_images_r2r_train.json"
     output_dir = "./output/rvln_sft_llm"
     # 训练参数
-    batch_size = 2
+    batch_size = 4 
     grad_accumulation = 8 # 稍微加大累积，模拟更大 batch
     learning_rate = 5e-5  # SFT LLM 学习率
     num_epochs = 3
     lora_rank = 32
     lora_alpha = 64
     
-    # ================= [SwanLab] 2. 初始化 SwanLab =================
-    # 在这里定义实验名称和需要记录的配置信息
-    swanlab.login(api_key="jpnq84pFWGxNf9thDyX9P")
-    swanlab.init(
-        project="Rvln-LoRA-SFT",
-        experiment_name="vicuna-7b-lora-stage2",
-        description="Rvln Stage 2 SFT with LoRA monitoring",
-        config={
-            "model_name": model_name_or_path,
-            "stage1_checkpoint": stage1_checkpoint,
-            "data_path": data_path,
-            "batch_size": batch_size,
-            "grad_accumulation": grad_accumulation,
-            "learning_rate": learning_rate,
-            "num_epochs": num_epochs,
-            "lora_rank": lora_rank,
-            "lora_alpha": lora_alpha,
-            "lora_dropout": 0.05,
-            "modules_to_save": ["embed_tokens", "lm_head"]# "score_head"
-        }
-    )
+    # [已移除] SwanLab 初始化代码块
+    # swanlab.login(...)
+    # swanlab.init(...)
     
     # =================1. Processor & Tokenizer=================
     print("Loading Processor...")
@@ -388,7 +238,7 @@ def main():
     model = RvlnMultiTask.from_pretrained(
         model_name_or_path,
         config=config,
-        torch_dtype=torch.float16
+        torch_dtype=torch.bfloat16
     )
 
     # 调整 Embedding 大小
@@ -430,7 +280,7 @@ def main():
     
     print_trainable_parameters(model)
 
-# ================= 5. Data Setup (关键修改：划分验证集) =================
+    # ================= 5. Data Setup (关键修改：划分验证集) =================
     print("Loading Full Dataset...")
     full_dataset = RvlnLoRADataset(
         data_path=data_path,
@@ -460,27 +310,33 @@ def main():
         qformer_tokenizer=qformer_tokenizer
     )
 
-    # ================= 6. Trainer Setup (关键修改：添加 Eval 配置) =================
+    # ================= 6. Trainer Setup =================
     training_args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accumulation,
         learning_rate=learning_rate,
         num_train_epochs=num_epochs,
-        fp16=True,
-        deepspeed="./ds_config_zero2.json",
+        fp16=False,
+        bf16=True,
+        deepspeed="./ds_config_zero2_1.json",
         remove_unused_columns=False,
-        report_to="none",
-        evaluation_strategy="steps",   # 按步数评估 (也可以选 "epoch")
-        eval_steps=1000,                # 每 100 步评估一次验证集 (根据你总步数调整)
-        per_device_eval_batch_size=batch_size, # 验证集的 Batch Size
-        save_strategy="steps",         # 必须和 evaluation_strategy 一致
-        save_steps=2000,                # 每 2000 步尝试保存
-        save_total_limit=2,            # 最多保留 2 个 checkpoint，省硬盘
-        load_best_model_at_end=True,   # 训练结束时，自动加载验证集效果最好的模型
-        metric_for_best_model="loss",  # 以 loss 为标准 (loss 越小越好)
-        greater_is_better=False,       # loss 是越小越好，所以是 False
+        report_to="none", 
+        evaluation_strategy="steps",   
+        eval_steps=1000,                
+        per_device_eval_batch_size=batch_size, 
+        save_strategy="steps",         
+        save_steps=2000,                
+        save_total_limit=2,            
+        load_best_model_at_end=True,   
+        metric_for_best_model="loss",  
+        greater_is_better=False,       
         logging_steps=4,
+        dataloader_num_workers=16,
+        dataloader_pin_memory=True,
+        tf32=True,
+        gradient_checkpointing=True,   
+        gradient_checkpointing_kwargs={'use_reentrant': False},
     )
 
     # 使用自定义 Trainer
@@ -492,14 +348,14 @@ def main():
         data_collator=collator,
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=[SwanLabCallback()],
+        callbacks=[], # [已移除] 移除了 SwanLabCallback
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
     )
 
     trainer.train()
     trainer.accelerator.wait_for_everyone()
     
-    # 仅由主进程触发保存逻辑（或者 trainer.save_model 内部会处理，但加上 wait 更安全）
+    # 仅由主进程触发保存逻辑
     if trainer.is_world_process_zero():
         trainer.save_model(output_dir)
     if dist.is_initialized():
