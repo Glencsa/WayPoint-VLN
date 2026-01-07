@@ -93,30 +93,18 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
 
         self.rgb_hidden_size = config.vision_config.hidden_size # 1408
         self.depth_hidden_size = self.depth_backbone.config.hidden_size # 768 (ViT-Base)
-        
+        self.qformer_hidden_size = config.qformer_config.hidden_size
         self.visual_fusion = DepthCrossAttentionFusion(
             rgb_dim=self.rgb_hidden_size,    
             depth_dim=self.depth_hidden_size, 
             num_heads=8 
         )
-
-        self.qformer_hidden_size = config.qformer_config.hidden_size
         self.itm_head = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(self.qformer_hidden_size, 512),
             nn.ReLU(),
             nn.Linear(512, 2) 
         )
-        llm_hidden_size = self.language_model.config.hidden_size
-        # self.score_head = nn.Sequential(
-        #     nn.Linear(llm_hidden_size, llm_hidden_size),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(llm_hidden_size, 10) # 输出 10 个 logits
-        # )
-        
-        # # 初始化分类头
-        # self._init_weights(self.score_head)
         self._init_weights(self.itm_head)
 
     def _init_weights(self, module):
@@ -151,7 +139,7 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         
         # 确保类型一致
         flat_depth_values = flat_depth_values.to(dtype=self.depth_backbone.dtype)
-
+        # (guanbin)为什么不训练深度编码器？
         with torch.no_grad():
             self.depth_backbone.eval()
             depth_outputs = self.depth_backbone(pixel_values=flat_depth_values, return_dict=True)
@@ -161,23 +149,16 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
                 depth_raw = depth_raw.to(rgb_embeds.dtype)
 
         # 3. 融合 RGB 和 Depth
-        # image_embeds 所在的设备就是我们后续计算的主设备 (Target Device)
         image_embeds = self.visual_fusion(rgb_embeds, depth_raw)
-        target_device = image_embeds.device  # <--- 获取当前特征所在的设备
+        target_device = image_embeds.device  
 
         # 4. 准备 Q-Former 输入
-        # 确保 image_attention_mask 在正确的设备上
         image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=target_device)
-        
-        # 确保 query_tokens 在正确的设备上
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1).to(target_device)
         
-        # === 强制将输入数据移动到 target_device ===
-        flat_qformer_input_ids = qformer_input_ids.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
-        flat_qformer_input_ids = flat_qformer_input_ids.to(target_device) # <--- 移动 Input IDs
-
-        flat_qformer_attention_mask = qformer_attention_mask.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
-        flat_qformer_attention_mask = flat_qformer_attention_mask.to(target_device) # <--- 移动 Attention Mask
+        # 将输入数据移动到 target_device 上
+        flat_qformer_input_ids = qformer_input_ids.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1).to(target_device)
+        flat_qformer_attention_mask = qformer_attention_mask.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1).to(target_device)
 
         # 创建 query mask (也在 target_device)
         query_attention_mask = torch.ones(
@@ -222,7 +203,6 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         
         return history_feats, current_feats
 
-    # === 健壮的 Token 替换逻辑 ===
     def _replace_image_tokens(self, inputs_embeds, input_ids, history_feats, current_feats, history_token_id, current_token_id):
         # 强制类型一致
         history_feats = history_feats.to(inputs_embeds.dtype)
@@ -273,7 +253,7 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             current_token_id = self.config.current_token_id
             
             inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
-            
+            # （guanbin）传入的是4个history，1个current的标签？
             inputs_embeds = self._replace_image_tokens(
                 inputs_embeds, input_ids, 
                 history_feats, current_feats, 
@@ -290,31 +270,12 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
                 return_dict=True
             )
             return outputs
-            # 训练分类头
-            # # 严谨做法：根据 attention_mask 找最后一个非 pad 的 token
-            # last_hidden_state = outputs.hidden_states[-1]
-            # batch_size = last_hidden_state.shape[0]
-            # sequence_lengths = (torch.eq(attention_mask, 1)).sum(1) - 1
-            # pooled_output = last_hidden_state[torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
-
-            # # 5. 分类 logits
-            # logits = self.score_head(pooled_output) # [B, 10]
-
-            # loss = None
-            # if class_labels is not None:
-            #     loss_fct = nn.CrossEntropyLoss()
-            #     loss = loss_fct(logits, class_labels)
-
-            # return {
-            #     "loss": loss,
-            #     "logits": logits
-            # }
 
     @torch.no_grad()
     def generate(
         self,
         pixel_values: torch.FloatTensor,
-        depth_pixel_values: torch.FloatTensor, # <--- 新增参数
+        depth_pixel_values: torch.FloatTensor, 
         qformer_input_ids: torch.LongTensor,
         qformer_attention_mask: torch.LongTensor,
         input_ids: torch.LongTensor,
