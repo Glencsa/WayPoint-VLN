@@ -30,7 +30,7 @@ def process_r2r_data(input_file, output_file):
             if 'depth_images_r2r_train/' in path:
                 # 分割路径，保留 'depth_images_r2r_train/' 之后的部分
                 suffix = path.split('depth_images_r2r_train/')[-1]
-                new_path = f"/media/isvl/T7/vln_dataset/our_dataset/depth_images_r2r_train/{suffix}"
+                new_path = f"/home/guanbin/scratch/dataset/r2r_dataset/depth_images_r2r_train/{suffix}"
                 new_depth_images.append(new_path)
             else:
                 # 如果路径格式不匹配，保持原样或打印警告
@@ -44,7 +44,7 @@ def process_r2r_data(input_file, output_file):
             if 'rgb_images_points/' in path:
                 # 分割路径，保留 'rgb_images_points/' 之后的部分
                 suffix = path.split('rgb_images_points/')[-1]
-                new_path = f"/media/isvl/T7/vln_dataset/our_dataset/rgb_images_points/{suffix}"
+                new_path = f"/home/guanbin/scratch/dataset/r2r_dataset/rgb_images_points/{suffix}"
                 new_rgb_images.append(new_path)
             else:
                 new_rgb_images.append(path)
@@ -76,7 +76,7 @@ def process_r2r_data(input_file, output_file):
 
 # 执行脚本
 if __name__ == "__main__":
-    input_filename = "/media/isvl/T7/vln_dataset/our_dataset/rgb_images_r2r_train.json"
-    output_filename = "/media/isvl/T7/vln_dataset/our_dataset/rgb_images_r2r_train_processed.json" # 保存为新文件以防覆盖
+    input_filename = "/media/isvl/T7/vln_dataset/our_dataset_part2/split_part2_moved.json"
+    output_filename = "/media/isvl/T7/vln_dataset/our_dataset_part2/rgb_images_r2r_train.json" # 保存为新文件以防覆盖
 
     process_r2r_data(input_filename, output_filename)

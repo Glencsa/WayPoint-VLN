@@ -1,81 +1,38 @@
-import json
-import os
+import torch
+from peft import PeftModel
+from models.rvln import RvlnMultiTask
+from transformers import InstructBlipProcessor
 
-# ================= 配置区域 =================
-# 1. 设置输入和输出文件名
-input_file = 'datasets/rgb_images_r2r_train.json'      # 原始数据
-output_file = 'datasets/filtered_traj_3279.json'       # 结果数据
+# 1. 路径
+base_model_path = "lora_weight/rvln_sft_llm" # 原始底座
+lora_model_path = "lora_weight/rvln_sft_llm"    # 你训练出的 Output (包含 adapter)
 
-# 目标轨迹 ID
-target_traj = "traj_3279"
+# 2. 加载底座
+print("Loading Base Model...")
+base_model = RvlnMultiTask.from_pretrained(
+    base_model_path,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
 
-# 新的路径前缀 (保持你之前的设置)
-rgb_prefix_new = "datasets/test/rgb/ep_4991/traj_3279"
-depth_prefix_new = "datasets/test/depth/ep_4991/traj_3279"
-# ===========================================
+# 3. 加载 LoRA
+print("Loading LoRA Adapter...")
+# 你的情况特殊：如果你的 output 已经是全量模型，这里可能会报错。
+# 只有当你按我之前教的方法，重新保存出只有几百 MB 的 adapter 文件夹后，才能用这步。
+model = PeftModel.from_pretrained(base_model.language_model, lora_model_path)
 
-def process_data():
-    try:
-        with open(input_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"❌ 错误：找不到文件 {input_file}")
-        return
+# 4. 【关键步骤】合并并卸载 LoRA
+print("Merging weights...")
+model = model.merge_and_unload()
 
-    processed_data = []
+# 此时 model 已经是一个普通的 torch.nn.Module，没有 peft 结构了
+# 所有的 lora_A, lora_B 都消失了，它们的值被加到了 base_model.weight 里
 
-    for entry in data:
-        # 1. 检查是否属于目标轨迹 traj_3279
-        if 'images' not in entry:
-            continue
-            
-        is_target_traj = any(target_traj in img_path for img_path in entry['images'])
-        
-        if is_target_traj:
-            new_rgb_list = []
-            new_depth_list = []
+# 5. 保存最终的完整模型
+save_path = "./lora_weight/rvln_final_merged"
+model.save_pretrained(save_path)
+# 别忘了保存 processor/tokenizer
+processor = InstructBlipProcessor.from_pretrained(base_model_path)
+processor.save_pretrained(save_path)
 
-            # 2. 处理每个图片路径
-            for old_path in entry['images']:
-                # 提取原始文件名 (例如: step_0.jpg)
-                file_name = os.path.basename(old_path)
-                
-                # 提取文件名核心部分 (例如: step_0)
-                # os.path.splitext('step_0.jpg') -> ('step_0', '.jpg')
-                name_part, _ = os.path.splitext(file_name)
-                
-                # --- RGB 处理 ---
-                # 要求: 改成 step_0_depth_with_points.jpg
-                new_rgb_name = f"{name_part}_depth_with_points.jpg"
-                new_rgb_path = os.path.join(rgb_prefix_new, new_rgb_name)
-                new_rgb_list.append(new_rgb_path)
-
-                # --- Depth 处理 ---
-                # 要求: 改成 step_0_depth.png
-                new_depth_name = f"{name_part}_depth.png"
-                new_depth_path = os.path.join(depth_prefix_new, new_depth_name)
-                new_depth_list.append(new_depth_path)
-
-            # 3. 更新条目数据
-            entry['images'] = new_rgb_list
-            entry['depth_images'] = new_depth_list
-
-            processed_data.append(entry)
-
-    # 4. 保存结果
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(processed_data, f, indent=2, ensure_ascii=False)
-
-    print(f"✅ 处理完成！")
-    print(f"共筛选并修改了 {len(processed_data)} 条数据。")
-    print(f"结果已保存至: {output_file}")
-    
-    # 打印示例以供检查
-    if processed_data:
-        print("\n--- 示例数据检查 (第一帧) ---")
-        print(f"原始文件名核心: {os.path.splitext(os.path.basename(data[0]['images'][0]))[0]}")
-        print(f"New RGB:   {processed_data[0]['images'][0]}")
-        print(f"New Depth: {processed_data[0]['depth_images'][0]}")
-
-if __name__ == '__main__':
-    process_data()
+print(f"✅ 模型合并完成！已保存至 {save_path}")

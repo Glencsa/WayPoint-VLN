@@ -139,14 +139,14 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         
         # 确保类型一致
         flat_depth_values = flat_depth_values.to(dtype=self.depth_backbone.dtype)
-        # (guanbin)为什么不训练深度编码器？
-        with torch.no_grad():
-            self.depth_backbone.eval()
-            depth_outputs = self.depth_backbone(pixel_values=flat_depth_values, return_dict=True)
-            depth_raw = depth_outputs.last_hidden_state 
-            
-            if depth_raw.dtype != rgb_embeds.dtype:
-                depth_raw = depth_raw.to(rgb_embeds.dtype)
+
+        # with torch.no_grad():
+        #     self.depth_backbone.eval()
+        depth_outputs = self.depth_backbone(pixel_values=flat_depth_values, return_dict=True)
+        depth_raw = depth_outputs.last_hidden_state 
+        
+        if depth_raw.dtype != rgb_embeds.dtype:
+            depth_raw = depth_raw.to(rgb_embeds.dtype)
 
         # 3. 融合 RGB 和 Depth
         image_embeds = self.visual_fusion(rgb_embeds, depth_raw)

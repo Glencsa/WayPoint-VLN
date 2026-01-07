@@ -185,36 +185,53 @@ class WeightedTrainer(Trainer):
         return (final_loss, outputs) if return_outputs else final_loss
 
     def save_model(self, output_dir=None, _internal_call=False):
-        """
-        重写保存逻辑：
-        保存 LoRA + Embeddings + Tokenizer
-        """
-        if output_dir is None:
-            output_dir = self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 1. 保存模型权重
-        super().save_model(output_dir, _internal_call)
-        
-        # 2. 保存 Tokenizer (只在主进程)
-        if self.is_world_process_zero():
-            # 兼容处理: 新版 Transformers 建议用 processing_class
-            saver = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
-            if saver:
-                saver.save_pretrained(output_dir)
-                print(f"Model components (Weights + Tokenizer) saved to {output_dir}")
+            """
+            自定义保存逻辑：针对嵌套 LoRA 结构 (Rvln -> LLM -> LoRA)
+            """
+            if output_dir is None:
+                output_dir = self.args.output_dir
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # --- 关键步骤：获取被 Unwrap 的模型 ---
+            # 如果使用了 DeepSpeed 或 DDP，最外层会被 wrap，需要先剥离
+            model_to_save = self.model
+            if hasattr(model_to_save, "module"):
+                model_to_save = model_to_save.module
+                
+            # --- 关键步骤：定位 LoRA 核心 ---
+            # 你的 LoRA 是加在 model.language_model 上的
+            # 这里的 peft_model 就是那个被 get_peft_model 包裹的对象
+            peft_model = model_to_save.language_model
+            
+            # 仅在主进程执行保存操作
+            if self.is_world_process_zero():
+                print(f"💾 Saving LoRA adapters and trained modules to {output_dir}...")
+                
+                # 1. 保存 LoRA 权重 + modules_to_save (embed_tokens, lm_head)
+                # PEFT 库会自动处理 modules_to_save，将它们和 adapter 一起存下来
+                peft_model.save_pretrained(output_dir)
+                
+                # 2. 保存 Tokenizer
+                saver = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+                if saver:
+                    saver.save_pretrained(output_dir)
+                
+                # 3. 保存 Config (可选，方便查看)
+                peft_model.config.save_pretrained(output_dir)
+
+                print(f"✅ Model components saved successfully.")
 def main():
     # =================Configuration=================
     model_name_or_path = "./instructblip-vicuna-7b" 
     # Weight: Fusion, Q-Former, Depth
     stage1_checkpoint = "checkpoints/latest_checkpoint.pth"
     data_path = "/home/guanbin/scratch/dataset/r2r_dataset/rgb_images_r2r_train.json"
-    output_dir = "./output/rvln_sft_llm"
+    output_dir = "./output/rvln_sft_llm_new"
     # 训练参数
     batch_size = 4 
     grad_accumulation = 8 # 稍微加大累积，模拟更大 batch
     learning_rate = 2e-4  # SFT LLM 学习率
-    num_epochs = 10 
+    num_epochs = 10
     lora_rank = 32
     lora_alpha = 64
     
@@ -381,9 +398,41 @@ def main():
     trainer.train()
     trainer.accelerator.wait_for_everyone()
     
-    # 仅由主进程触发保存逻辑
+    # ================= 7. Merge & Save Full Model (训练结束后) =================
     if trainer.is_world_process_zero():
-        trainer.save_model(output_dir)
+        print("⏳ Starting Merge and Save process...")
+        
+        # 1. 获取模型本体 (剥离 DeepSpeed/DDP 的封装)
+        # model_to_merge 指向 RvlnMultiTask 实例
+        model_to_merge = trainer.model
+        if hasattr(model_to_merge, "module"):
+            model_to_merge = model_to_merge.module
+
+        # 2. 切换到评估模式 (关闭 Dropout 等)
+        model_to_merge.eval()
+
+        # 3. 关键步骤：合并 LoRA 到 LLM
+        # model_to_merge.language_model 目前是 PeftModel
+        print("   - Merging LoRA weights into LLM...")
+        
+        # merge_and_unload() 会将 lora_A * lora_B 加回到 base_layer
+        # 并返回标准的 LlamaForCausalLM (不再是 PeftModel)
+        # 我们将其赋值回 language_model 属性，替换掉原来的 PeftModel
+        model_to_merge.language_model = model_to_merge.language_model.merge_and_unload()
+
+        # 4. 保存完整模型
+        # 因为 RvlnMultiTask 继承自 PreTrainedModel，它会递归调用子模块的 save_pretrained
+        merge_output_dir = os.path.join(output_dir, "merged_full_model")
+        os.makedirs(merge_output_dir, exist_ok=True)
+        
+        print(f"   - Saving full model to {merge_output_dir}...")
+        model_to_merge.save_pretrained(merge_output_dir)
+        
+        # 5. 保存 Tokenizer
+        tokenizer.save_pretrained(merge_output_dir)
+        
+        print("✅ Full merged model saved! You can now use from_pretrained() to load it.")
+
     if dist.is_initialized():
         dist.destroy_process_group()
 
