@@ -5,6 +5,8 @@ import torch.distributed as dist
 import numpy as np 
 import torch.nn.functional as F
 from torch.utils.data import random_split
+import swanlab
+from swanlab.integration.huggingface import SwanLabCallback
 from transformers import (
     InstructBlipProcessor,
     InstructBlipConfig,
@@ -217,9 +219,25 @@ def main():
     lora_rank = 32
     lora_alpha = 64
     
-    # [已移除] SwanLab 初始化代码块
-    # swanlab.login(...)
-    # swanlab.init(...)
+    swanlab.login(api_key="jpnq84pFWGxNf9thDyX9P")
+    swanlab.init(
+        project="Rvln-LoRA-SFT",
+        experiment_name="vicuna-7b-lora-stage2",
+        description="Rvln Stage 2 SFT with LoRA monitoring",
+        config={
+            "model_name": model_name_or_path,
+            "stage1_checkpoint": stage1_checkpoint,
+            "data_path": data_path,
+            "batch_size": batch_size,
+            "grad_accumulation": grad_accumulation,
+            "learning_rate": learning_rate,
+            "num_epochs": num_epochs,
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": 0.05,
+            "modules_to_save": ["embed_tokens", "lm_head"]# "score_head"
+        }
+    )
     
     # =================1. Processor & Tokenizer=================
     print("Loading Processor...")
@@ -357,7 +375,7 @@ def main():
         data_collator=collator,
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=[], # [已移除] 移除了 SwanLabCallback
+        callbacks=[SwanLabCallback()],
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
     )
 
