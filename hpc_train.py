@@ -375,40 +375,40 @@ def main():
     trainer.train()
     trainer.accelerator.wait_for_everyone()
     
-    # ================= 7. Merge & Save Full Model (训练结束后) =================
+    # ================= 7. Save Adapter Only (常规保存 LoRA，不合并) =================
+    # 仅主进程执行保存，避免多进程写入冲突
     if trainer.is_world_process_zero():
-        print("⏳ Starting Merge and Save process...")
+        print("⏳ Starting Save process (Adapter Only)...")
         
-        # 1. 获取模型本体 (剥离 DeepSpeed/DDP 的封装)
-        # model_to_merge 指向 RvlnMultiTask 实例
-        model_to_merge = trainer.model
-        if hasattr(model_to_merge, "module"):
-            model_to_merge = model_to_merge.module
+        # 1. 定义保存路径 (建议单独一个子文件夹，清晰明了)
+        final_adapter_dir = os.path.join(output_dir, "final_adapter")
+        os.makedirs(final_adapter_dir, exist_ok=True)
 
-        # 2. 切换到评估模式 (关闭 Dropout 等)
-        model_to_merge.eval()
+        # 2. 获取模型本体 (剥离 DeepSpeed/DDP 的封装)
+        model_to_save = trainer.model
+        if hasattr(model_to_save, "module"):
+            model_to_save = model_to_save.module
 
-        # 3. 关键步骤：合并 LoRA 到 LLM
-        # model_to_merge.language_model 目前是 PeftModel
-        print("   - Merging LoRA weights into LLM...")
+        # 3. 关键步骤：定位 LoRA 模块
+        # 你的 LoRA 是加在 model.language_model 上的，它是一个 PeftModel 对象
+        peft_model = model_to_save.language_model
         
-        # merge_and_unload() 会将 lora_A * lora_B 加回到 base_layer
-        # 并返回标准的 LlamaForCausalLM (不再是 PeftModel)
-        # 我们将其赋值回 language_model 属性，替换掉原来的 PeftModel
-        model_to_merge.language_model = model_to_merge.language_model.merge_and_unload()
-
-        # 4. 保存完整模型
-        # 因为 RvlnMultiTask 继承自 PreTrainedModel，它会递归调用子模块的 save_pretrained
-        merge_output_dir = os.path.join(output_dir, "merged_full_model")
-        os.makedirs(merge_output_dir, exist_ok=True)
-        
-        print(f"   - Saving full model to {merge_output_dir}...")
-        model_to_merge.save_pretrained(merge_output_dir)
+        # 4. 保存 LoRA 权重
+        # PEFT 库会自动检测 config 中的 modules_to_save (embed_tokens, lm_head)
+        # 并将它们与 lora 权重一起保存到 adapter_model.safetensors 中
+        print(f"   - Saving LoRA adapters and trainable modules to {final_adapter_dir}...")
+        peft_model.save_pretrained(final_adapter_dir)
         
         # 5. 保存 Tokenizer
-        tokenizer.save_pretrained(merge_output_dir)
+        # 确保推理时使用的 tokenizer 与训练时一致
+        print("   - Saving Tokenizer...")
+        tokenizer.save_pretrained(final_adapter_dir)
         
-        print("✅ Full merged model saved! You can now use from_pretrained() to load it.")
+        # 6. 保存 LoRA Config (包含 rank, alpha, base_model_path 等信息)
+        peft_model.config.save_pretrained(final_adapter_dir)
+
+        print(f"✅ Adapter saved successfully! Path: {final_adapter_dir}")
+        print("   (You can load this with PeftModel.from_pretrained over the base model)")
 
     if dist.is_initialized():
         dist.destroy_process_group()
