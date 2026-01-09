@@ -47,7 +47,6 @@ Depth-Anything-V2-Small-hf
 checkpoints_itm_fusion
 checkpoints_itm_cross_attn
 images/
-dataset_instructblip.json
 vit-base-patch16-224/
 checkpoints_itm_cross_attn_with_depth/
 checkpoints_itm_cross_attn_with_depth_qformer/
@@ -58,3 +57,6 @@ datasets/
 checkpoint/
 dataset_waypoint/
 logs/
+lora_weight/
+test.jpeg
+test_data/

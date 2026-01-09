@@ -183,41 +183,47 @@ class WeightedTrainer(Trainer):
         return (final_loss, outputs) if return_outputs else final_loss
 
     def save_model(self, output_dir=None, _internal_call=False):
-            """
-            自定义保存逻辑：针对嵌套 LoRA 结构 (Rvln -> LLM -> LoRA)
-            """
-            if output_dir is None:
-                output_dir = self.args.output_dir
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # --- 关键步骤：获取被 Unwrap 的模型 ---
-            # 如果使用了 DeepSpeed 或 DDP，最外层会被 wrap，需要先剥离
-            model_to_save = self.model
-            if hasattr(model_to_save, "module"):
-                model_to_save = model_to_save.module
-                
-            # --- 关键步骤：定位 LoRA 核心 ---
-            # 你的 LoRA 是加在 model.language_model 上的
-            # 这里的 peft_model 就是那个被 get_peft_model 包裹的对象
-            peft_model = model_to_save.language_model
-            
-            # 仅在主进程执行保存操作
-            if self.is_world_process_zero():
-                print(f"💾 Saving LoRA adapters and trained modules to {output_dir}...")
-                
-                # 1. 保存 LoRA 权重 + modules_to_save (embed_tokens, lm_head)
-                # PEFT 库会自动处理 modules_to_save，将它们和 adapter 一起存下来
-                peft_model.save_pretrained(output_dir)
-                
-                # 2. 保存 Tokenizer
-                saver = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
-                if saver:
-                    saver.save_pretrained(output_dir)
-                
-                # 3. 保存 Config (可选，方便查看)
-                peft_model.config.save_pretrained(output_dir)
+        """
+        修正后的保存逻辑：
+        1. 兼容 DeepSpeed (使用 unwrap_model)
+        2. 保存 LoRA
+        3. 保存 Stage 1 冻结权重 (让每个 checkpoint 都能独立运行)
+        """
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
 
-                print(f"✅ Model components saved successfully.")
+        # 仅在主进程执行
+        if self.is_world_process_zero():
+            print(f"💾 Saving Checkpoint to {output_dir}...")
+            
+            # 1. 关键：正确解包模型 (兼容 DeepSpeed Zero-2/3)
+            # self.accelerator 是 Trainer 自带的属性
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            
+            # 2. 保存 LoRA (LLM 部分)
+            # 你的 LoRA 是在 language_model 上，且它是 PeftModel
+            peft_model = unwrapped_model.language_model
+            peft_model.save_pretrained(output_dir)
+            
+            # 3. [新增] 保存 Stage 1 权重 (Fusion & Depth)
+            # 这样 checkpoint 文件夹里就有了 stage1_visual_weights.pth
+            stage1_weights = {}
+            for name, param in unwrapped_model.named_parameters():
+                if "language_model" not in name:
+                    stage1_weights[name] = param.cpu()
+            
+            torch.save(stage1_weights, os.path.join(output_dir, "stage1_visual_weights.pth"))
+
+            # 4. 保存 Processor / Tokenizer
+            saver = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+            if saver:
+                saver.save_pretrained(output_dir)
+                
+            # 5. 保存 LoRA Config
+            peft_model.config.save_pretrained(output_dir)
+
+            print(f"✅ Checkpoint saved: LoRA + Stage1 Weights included.")
 def main():
     # =================Configuration=================
     model_name_or_path = "./instructblip-vicuna-7b" 
@@ -375,43 +381,42 @@ def main():
     trainer.train()
     trainer.accelerator.wait_for_everyone()
     
-    # ================= 7. Save Adapter Only (常规保存 LoRA，不合并) =================
-    # 仅主进程执行保存，避免多进程写入冲突
+# ================= 7. Save Adapter & Dependencies =================
+    # 仅主进程执行保存
     if trainer.is_world_process_zero():
-        print("⏳ Starting Save process (Adapter Only)...")
+        print("⏳ Starting Save process...")
         
-        # 1. 定义保存路径 (建议单独一个子文件夹，清晰明了)
         final_adapter_dir = os.path.join(output_dir, "final_adapter")
         os.makedirs(final_adapter_dir, exist_ok=True)
 
-        # 2. 获取模型本体 (剥离 DeepSpeed/DDP 的封装)
-        model_to_save = trainer.model
-        if hasattr(model_to_save, "module"):
-            model_to_save = model_to_save.module
-
-        # 3. 关键步骤：定位 LoRA 模块
-        # 你的 LoRA 是加在 model.language_model 上的，它是一个 PeftModel 对象
-        peft_model = model_to_save.language_model
+        # 1. [优化] 使用 Accelerator 解包模型 (兼容 DeepSpeed)
+        # 这会剥离 DeepSpeed/DDP 壳子，拿到原始的 RvlnMultiTask
+        unwrapped_model = trainer.accelerator.unwrap_model(trainer.model)
         
-        # 4. 保存 LoRA 权重
-        # PEFT 库会自动检测 config 中的 modules_to_save (embed_tokens, lm_head)
-        # 并将它们与 lora 权重一起保存到 adapter_model.safetensors 中
-        print(f"   - Saving LoRA adapters and trainable modules to {final_adapter_dir}...")
+        # 2. 保存 LoRA 权重 (包含 Embeddings/Head)
+        print(f"   - Saving LoRA adapters to {final_adapter_dir}...")
+        peft_model = unwrapped_model.language_model
         peft_model.save_pretrained(final_adapter_dir)
-        
-        # 5. 保存 Tokenizer
-        # 确保推理时使用的 tokenizer 与训练时一致
-        print("   - Saving Tokenizer...")
-        tokenizer.save_pretrained(final_adapter_dir)
-        
-        # 6. 保存 LoRA Config (包含 rank, alpha, base_model_path 等信息)
-        peft_model.config.save_pretrained(final_adapter_dir)
 
-        print(f"✅ Adapter saved successfully! Path: {final_adapter_dir}")
-        print("   (You can load this with PeftModel.from_pretrained over the base model)")
+        # 3. 手动保存 Stage 1 权重 (Fusion & Depth)
+        # 这样你的 output 文件夹就是独立的，不再依赖外部的 stage1_checkpoint
+        print(f"   - Saving Stage 1 frozen weights (Safety Backup)...")
+        stage1_weights = {}
+        for name, param in unwrapped_model.named_parameters():
+            # 筛选出不属于 LLM 的参数 (即 Visual, Depth, Fusion 部分)
+            if "language_model" not in name:
+                stage1_weights[name] = param.cpu()
+        
+        torch.save(stage1_weights, os.path.join(final_adapter_dir, "stage1_visual_weights.pth"))
 
-    if dist.is_initialized():
-        dist.destroy_process_group()
+        # 4. 保存完整的 Processor (不仅仅是 Tokenizer)
+        print("   - Saving Processor (Tokenizer + Image Config)...")
+        if processor:
+            processor.save_pretrained(final_adapter_dir)
+        else:
+            tokenizer.save_pretrained(final_adapter_dir)
+        
+        print(f"✅ Save Complete! Output Checkpoint is self-contained in: {final_adapter_dir}")
 
 if __name__ == "__main__":
     main()
