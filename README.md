@@ -4,8 +4,8 @@
 <div style="text-align: center;">
   <p class="title is-5 mt-2 authors" align="center"> 
     <a href="https://github.com/zzywhu" target="_blank">Zhiyu Zhou</a><sup>1*</sup>, 
-    <a href="https://github.com/Glencsa" target="_blank">Bin Guan</a><sup>1*</sup>, 
     <a href="https://github.com/binbin2002" target="_blank">Wenbin Yang</a><sup>1*</sup> ,
+    <a href="https://github.com/Glencsa" target="_blank">Bin Guan</a><sup>1*</sup>, 
     <a href="http://www.lianpp.com/whu/smu_rsgis/info/1004/7224.htm" target="_blank">Zhi Gao</a><sup>1&#9993;</sup>
   </p>
 </div>
