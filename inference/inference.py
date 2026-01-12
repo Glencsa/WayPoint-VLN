@@ -87,14 +87,24 @@ def load_combined_model():
         checkpoint = torch.load(ITM_CHECKPOINT_PATH, map_location="cpu")
         if 'depth_backbone' in checkpoint:
             model.depth_backbone.load_state_dict(checkpoint['depth_backbone'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 depth_backbone 部分，跳过该部分加载。")
         if 'visual_fusion' in checkpoint:
             model.visual_fusion.load_state_dict(checkpoint['visual_fusion'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 visual_fusion 部分，跳过该部分加载。")
         if 'itm_head' in checkpoint:
             model.itm_head.load_state_dict(checkpoint['itm_head'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 itm_head 部分，跳过该部分加载。")
         if 'qformer' in checkpoint:
             model.qformer.load_state_dict(checkpoint['qformer'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 qformer 部分，跳过该部分加载。")
         if 'query_tokens' in checkpoint:
             model.query_tokens.data = checkpoint['query_tokens'].data.to(DEVICE)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 query_tokens 部分，跳过该部分加载。")
         # 加载 ITM Head
         if 'itm_head' in checkpoint:
             try:

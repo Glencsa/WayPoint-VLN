@@ -80,7 +80,7 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             raise ValueError("Config must contain 'current_token_id'")
         
         # 我们使用 ImageNet 预训练的 ViT-Base 来提取深度图特征
-        depth_encoder_name = "./vit-base-patch16-224"
+        depth_encoder_name = "/home/isvl/guan_code/RVLN/vit-base-patch16-224"
         print(f"Loading Depth Encoder: {depth_encoder_name}...")
         self.depth_backbone = ViTModel.from_pretrained(depth_encoder_name, add_pooling_layer=False)
         

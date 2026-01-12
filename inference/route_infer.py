@@ -36,8 +36,31 @@ def load_model():
         CHECKPOINT_PATH,
         torch_dtype=DTYPE,
     ).to(DEVICE)
+    if os.path.exists(stage1_checkpoint):
+        print(f"📥 发现 ITM 权重: {stage1_checkpoint}，正在加载覆盖...")
+        checkpoint = torch.load(stage1_checkpoint, map_location="cpu")
+        if 'depth_backbone' in checkpoint:
+            model.depth_backbone.load_state_dict(checkpoint['depth_backbone'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 depth_backbone 部分，跳过该部分加载。")
+        if 'visual_fusion' in checkpoint:
+            model.visual_fusion.load_state_dict(checkpoint['visual_fusion'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 visual_fusion 部分，跳过该部分加载。")
+        if 'itm_head' in checkpoint:
+            model.itm_head.load_state_dict(checkpoint['itm_head'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 itm_head 部分，跳过该部分加载。")
+        if 'qformer' in checkpoint:
+            model.qformer.load_state_dict(checkpoint['qformer'], strict=True)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 qformer 部分，跳过该部分加载。")
+        if 'query_tokens' in checkpoint:
+            model.query_tokens.data = checkpoint['query_tokens'].data.to(DEVICE)
+        else :
+            print("   ⚠️ 警告: ITM 权重中未找到 query_tokens 部分，跳过该部分加载。")
     model.eval()
-    model_emb_size = model.language_model.get_input_embeddings().weight.shape[0]
+    # model_emb_size = model.language_model.get_input_embeddings().weight.shape[0]
     # print(f"   -> Model Embedding Size: {model_emb_size}")
     # model.language_model.resize_token_embeddings(len(tokenizer))
     print("Model loaded successfully!")
@@ -90,8 +113,8 @@ if __name__ == "__main__":
     
     # 场景 1: 只有当前一张图 (刚启动)
     # 系统会自动补齐为: [黑, 黑, 黑, 黑, Img1]
-    rgb_1 = ["test_data/rgb/step_0_depth_with_points.jpg"]
-    depth_1 = ["test_data/depth/step_0_depth.png"]
+    rgb_1 = ["test_data/rgb.jpg"]
+    depth_1 = ["test_data/depth.jpg"]
     run_inference(model, processor, rgb_1, depth_1, instruction)
 
     # 场景 2: 已经走了几步 (历史队列)
