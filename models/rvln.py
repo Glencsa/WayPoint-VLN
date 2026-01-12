@@ -299,7 +299,7 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         
         if attention_mask is None:
             attention_mask = torch.ones(input_ids.shape, device=input_ids.device)
-
+        # print("inputs_embeds:", inputs_embeds)
         return self.language_model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -398,7 +398,7 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             device=input_ids.device
         )
         qformer_attention_mask = torch.cat([query_attention_mask, flat_attention_mask], dim=1)
-
+        print("input:", flat_input_ids)
         # 6. Q-Former 前向传播
         query_outputs = self.qformer(
             input_ids=flat_input_ids,
@@ -408,7 +408,7 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             encoder_attention_mask=image_attention_mask,
             return_dict=True,
         )
-        
+        print("query_outputs:", query_outputs)
         # [B_total, 32 + Seq_Len, 768]
         qformer_features = query_outputs.last_hidden_state
         

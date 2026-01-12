@@ -117,8 +117,8 @@ def run_inference():
     model, processor, qformer_tokenizer = load_combined_model()
 
     # 准备测试数据 (通用)
-    img_path = "test_data/rgb.jpg"
-    depth_path = "test_data/depth.jpg"
+    img_path = "rgb.jpg"
+    depth_path = "depth.jpg"
     raw_image = Image.open(img_path).convert("RGB")
 
     # 准备深度图 (如果没有，用纯黑替代测试)
@@ -214,6 +214,7 @@ def run_inference():
             input_ids=text_inputs.input_ids,
             attention_mask=text_inputs.attention_mask
         )
+        print("Raw ITM logits:", logits)
         probs = torch.softmax(logits, dim=1)
     
     print("\n匹配结果:")

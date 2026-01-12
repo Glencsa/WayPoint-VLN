@@ -59,7 +59,7 @@ def run_inference(model, processor, rgb_input, depth_input, instruction):
     
     # 1. 预处理 (自动补齐)
     inputs = prepare_inputs_for_generate(rgb_input, depth_input, instruction, processor, model.device)
-    
+    # print("input:"  , inputs)
     # 2. 生成
     print("🚀 Generating...")
     with torch.no_grad():
@@ -76,6 +76,7 @@ def run_inference(model, processor, rgb_input, depth_input, instruction):
         )
 
     # 3. 解码
+    print("output:", outputs)
     output_text = processor.batch_decode(outputs, skip_special_tokens=True)[0]
     
     print("-" * 40)
@@ -86,17 +87,17 @@ if __name__ == "__main__":
     # 初始化
     model, processor = load_model()
     
-    instruction = 'Go around the right side of the center unit and stop by the right side doorway with the dining table and mirror in it.'
+    instruction = 'Walk past the foot of the bed and exit the bedroom through the double doors ahead of you. Once out of the bedroom take a quick dogleg to the left and enter the large room with a chandelier ahead of you.'
     
     # 场景 1: 只有当前一张图 (刚启动)
     # 系统会自动补齐为: [黑, 黑, 黑, 黑, Img1]
-    rgb_1 = ["test_data/rgb/step_0_depth_with_points.jpg"]
-    depth_1 = ["test_data/depth/step_0_depth.png"]
+    rgb_1 = ["/home/yang/VLN/RVLN/rgb.jpg"]
+    depth_1 = ["/home/yang/VLN/RVLN/depth.jpg"]
     run_inference(model, processor, rgb_1, depth_1, instruction)
 
-    # 场景 2: 已经走了几步 (历史队列)
-    # 系统会自动取最后5张: [Img1, Img2, Img3, Img4, Img5] (假设 Img5 是当前)
-    # 这里用同一个图模拟多帧
-    rgb_history = [rgb_1[0]] * 6  # 模拟有6张图
-    depth_history = [depth_1[0]] * 6
-    run_inference(model, processor, rgb_history, depth_history, instruction)
+    # # 场景 2: 已经走了几步 (历史队列)
+    # # 系统会自动取最后5张: [Img1, Img2, Img3, Img4, Img5] (假设 Img5 是当前)
+    # # 这里用同一个图模拟多帧
+    # rgb_history = [rgb_1[0]] * 6  # 模拟有6张图
+    # depth_history = [depth_1[0]] * 6
+    # run_inference(model, processor, rgb_history, depth_history, instruction)
