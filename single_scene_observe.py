@@ -8,18 +8,174 @@ EPISODE_ID = "6296"  # 优先使用 episode 过滤，若不想用则置为 None
 SCENE_ID = None       # 若 EPISODE_ID 为 None 时按 scene 过滤
 ACTION = 2           # 单步动作，默认 MOVE_FORWARD=1；可改为 0:STOP, 2:TURN_LEFT, 3:TURN_RIGHT
 
+# RVLN 模型配置
+CHECKPOINT_PATH = "output/rvln_merged_final"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16
+
 import os
 import json
 import numpy as np
+import torch
 from typing import Optional
+from PIL import Image
 
 from habitat.datasets import make_dataset
 from habitat import Env
 from VLN_CE.vlnce_baselines.config.default import get_config
 
+# 导入 RVLN 相关模块
+import sys
+current_file_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, current_file_dir)
+
+from transformers import InstructBlipProcessor
+from models.rvln import RvlnMultiTask
+from utils.utils import prepare_inputs_for_generate
+
 # 确保结果根目录存在（启动即创建）
 os.makedirs(RESULT_PATH, exist_ok=True)
 print(f"[INFO] Result root ensured: {os.path.abspath(RESULT_PATH)}")
+
+
+class RVLNAgent:
+    """RVLN 模型代理，负责加载模型并进行路线推断"""
+    
+    def __init__(self, checkpoint_path, device="cuda", dtype=torch.float16):
+        self.checkpoint_path = checkpoint_path
+        self.device = device
+        self.dtype = dtype
+        self.model = None
+        self.processor = None
+        
+        # 历史观测队列（最多保存4帧历史 + 1帧当前 = 5帧）
+        self.rgb_history = []
+        self.depth_history = []
+        
+    def load_model(self):
+        """加载 RVLN 模型和处理器"""
+        print(f"[AGENT] Loading RVLN model from: {self.checkpoint_path}")
+        
+        # 加载 Processor
+        self.processor = InstructBlipProcessor.from_pretrained(self.checkpoint_path)
+        tokenizer = self.processor.tokenizer
+        tokenizer.padding_side = "right"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            
+        # 加载模型
+        self.model = RvlnMultiTask.from_pretrained(
+            self.checkpoint_path,
+            torch_dtype=self.dtype,
+        ).to(self.device)
+        self.model.eval()
+        
+        print(f"[AGENT] Model loaded successfully on {self.device}")
+        
+    def reset_history(self):
+        """重置历史观测队列"""
+        self.rgb_history = []
+        self.depth_history = []
+        print("[AGENT] History queue reset")
+        
+    def add_observation(self, rgb_image, depth_image):
+        """
+        添加新的观测到历史队列
+        rgb_image: PIL Image 或 numpy array
+        depth_image: PIL Image 或 numpy array
+        """
+        # 转换为 PIL Image
+        if isinstance(rgb_image, np.ndarray):
+            if rgb_image.dtype != np.uint8:
+                if rgb_image.max() <= 1.0:
+                    rgb_image = (rgb_image * 255.0).clip(0, 255).astype(np.uint8)
+                else:
+                    rgb_image = rgb_image.clip(0, 255).astype(np.uint8)
+            rgb_image = Image.fromarray(rgb_image[..., :3] if rgb_image.ndim == 3 else rgb_image)
+            
+        if isinstance(depth_image, np.ndarray):
+            # 深度图归一化可视化
+            d = depth_image.astype(np.float32)
+            d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+            if d.ndim == 3 and d.shape[2] == 1:
+                d = d[..., 0]
+            elif d.ndim == 3:
+                d = d.mean(axis=2)
+            d_min, d_max = float(d.min()), float(d.max())
+            if d_max > d_min:
+                d_norm = (d - d_min) / (d_max - d_min)
+            else:
+                d_norm = np.zeros_like(d)
+            d_vis = (d_norm * 255.0).clip(0, 255).astype(np.uint8)
+            depth_image = Image.fromarray(d_vis)
+            
+        self.rgb_history.append(rgb_image)
+        self.depth_history.append(depth_image)
+        
+    def predict_route(self, instruction):
+        """
+        基于当前历史队列预测最佳路线
+        返回: 预测的路线编号（-1 到 8）
+        """
+        if self.model is None or self.processor is None:
+            raise RuntimeError("[AGENT] Model not loaded. Call load_model() first.")
+            
+        if len(self.rgb_history) == 0:
+            raise RuntimeError("[AGENT] No observations in history. Call add_observation() first.")
+            
+        print(f"[AGENT] Predicting route with {len(self.rgb_history)} observations...")
+        
+        # 准备输入（自动补齐到5帧）
+        inputs = prepare_inputs_for_generate(
+            self.rgb_history,
+            self.depth_history,
+            instruction,
+            self.processor,
+            self.device
+        )
+        
+        # 生成预测
+        with torch.no_grad():
+            outputs = self.model.generate(
+                pixel_values=inputs["pixel_values"],
+                depth_pixel_values=inputs["depth_pixel_values"],
+                qformer_input_ids=inputs["qformer_input_ids"],
+                qformer_attention_mask=inputs["qformer_attention_mask"],
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=100,
+                do_sample=False,
+                repetition_penalty=1.0
+            )
+        
+        # 解码输出
+        output_text = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+        print(f"[AGENT] Model output: {output_text}")
+        
+        # 解析路线编号（从输出文本中提取）
+        route_number = self._parse_route_number(output_text)
+        print(f"[AGENT] Predicted route: {route_number}")
+        
+        return route_number, output_text
+        
+    def _parse_route_number(self, output_text):
+        """从模型输出文本中解析路线编号"""
+        import re
+        
+        # 尝试匹配 {'Route': N} 格式
+        match = re.search(r"['\"]?Route['\"]?\s*:\s*(-?\d+)", output_text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+            
+        # 尝试匹配纯数字
+        match = re.search(r"(-?\d+)", output_text)
+        if match:
+            return int(match.group(1))
+            
+        # 默认返回 -1（停止）
+        print(f"[AGENT] Warning: Could not parse route number from: {output_text}")
+        return -1
+
 
 def _get_instruction_text(ep) -> Optional[str]:
     candidates = [
@@ -178,7 +334,7 @@ def save_observation(env, obs, result_path, step_idx=0):
 
 class InteractiveSession:
     """支持增量式操作的交互会话：初始化、保存当前观测、按动作步进并保存。"""
-    def __init__(self, base_dir, exp_config, result_path, episode_id=None, scene_id=None):
+    def __init__(self, base_dir, exp_config, result_path, episode_id=None, scene_id=None, use_agent=False):
         self.base_dir = base_dir
         self.exp_config = exp_config
         self.result_path = result_path
@@ -187,6 +343,12 @@ class InteractiveSession:
         self.env = None
         self.obs = None
         self.step_idx = 0
+        
+        # RVLN Agent 相关
+        self.use_agent = use_agent
+        self.agent = None
+        if self.use_agent:
+            self.agent = RVLNAgent(CHECKPOINT_PATH, DEVICE, DTYPE)
 
     def init(self):
         # 切到 VLN_CE 目录，保证相对路径可用
@@ -210,9 +372,23 @@ class InteractiveSession:
         self.env = Env(config.TASK_CONFIG, dataset)
         self.obs = self.env.reset()
         self.step_idx = 0
+        
         # 初始化时也确保结果根目录存在
         os.makedirs(self.result_path, exist_ok=True)
         print(f"[INFO] Result root ensured in init: {os.path.abspath(self.result_path)}")
+        
+        # 如果使用 agent，加载模型并重置历史
+        if self.use_agent and self.agent is not None:
+            self.agent.load_model()
+            self.agent.reset_history()
+            
+            # 添加初始观测到 agent
+            rgb = self.obs.get("rgb", self.obs.get("rgb_sensor", None))
+            depth = self.obs.get("depth", self.obs.get("depth_sensor", None))
+            if rgb is not None and depth is not None:
+                self.agent.add_observation(rgb, depth)
+                print("[INFO] Initial observation added to agent")
+        
         return self.obs
 
     def save_current(self):
@@ -222,11 +398,44 @@ class InteractiveSession:
         print(f"[INFO] Initial observation saved for step {self.step_idx}.")
         return meta
 
+    def predict_next_action(self):
+        """使用 agent 预测下一步动作"""
+        if not self.use_agent or self.agent is None:
+            raise RuntimeError("Agent not enabled. Set use_agent=True when creating session.")
+        
+        if self.env is None:
+            raise RuntimeError("Session not initialized. Call init() first.")
+        
+        # 获取当前 episode 的指令
+        instruction = _get_instruction_text(self.env.current_episode)
+        if instruction is None:
+            instruction = "Navigate to the target location."
+        
+        print(f"\n[INFO] Instruction: {instruction}")
+        
+        # 使用 agent 预测路线
+        route_number, output_text = self.agent.predict_route(instruction)
+        
+        return {
+            "route_number": route_number,
+            "output_text": output_text,
+            "instruction": instruction
+        }
+
     def step(self, action):
         if self.env is None:
             raise RuntimeError("Session not initialized. Call init() first.")
         self.obs, info, done, episode_id = step(self.env, action)
         self.step_idx += 1
+        
+        # 如果使用 agent，添加新观测到历史队列
+        if self.use_agent and self.agent is not None:
+            rgb = self.obs.get("rgb", self.obs.get("rgb_sensor", None))
+            depth = self.obs.get("depth", self.obs.get("depth_sensor", None))
+            if rgb is not None and depth is not None:
+                self.agent.add_observation(rgb, depth)
+                print(f"[INFO] Step {self.step_idx} observation added to agent (history length: {len(self.agent.rgb_history)})")
+        
         meta = save_observation(self.env, self.obs, self.result_path, step_idx=self.step_idx)
         print(f"[INFO] Step {self.step_idx} saved.")
         return {
@@ -257,5 +466,80 @@ def run_single_scene_observe(exp_config: str, result_path: str, episode_id: Opti
     print(json.dumps({"step": out_meta_step}, ensure_ascii=False, indent=2))
 
 
+def run_with_agent_demo(exp_config: str, result_path: str, episode_id: Optional[str], scene_id: Optional[str], max_steps: int = 10) -> None:
+    """
+    使用 RVLN Agent 进行自动导航的演示
+    
+    参数:
+        exp_config: 实验配置文件路径
+        result_path: 结果保存路径
+        episode_id: episode ID（可选）
+        scene_id: scene ID（可选）
+        max_steps: 最大步数
+    """
+    # 创建带 agent 的交互会话
+    session = InteractiveSession(BASE_DIR, exp_config, result_path, episode_id, scene_id, use_agent=True)
+    
+    # 初始化环境和模型
+    print("=" * 60)
+    print("初始化环境和 RVLN Agent...")
+    print("=" * 60)
+    obs = session.init()
+    out_meta_init = session.save_current()
+    print(json.dumps({"init": out_meta_init}, ensure_ascii=False, indent=2))
+    
+    # 开始导航循环
+    for step_idx in range(max_steps):
+        print("\n" + "=" * 60)
+        print(f"Step {step_idx + 1}/{max_steps}")
+        print("=" * 60)
+        
+        # 使用 agent 预测下一步动作
+        prediction = session.predict_next_action()
+        print(f"\n[PREDICTION]")
+        print(f"  Route Number: {prediction['route_number']}")
+        print(f"  Model Output: {prediction['output_text']}")
+        print(f"  Instruction: {prediction['instruction']}")
+        
+        # 将路线编号映射为 Habitat 动作
+        # -1: STOP, 0: TURN_LEFT_30, 1-7: 路线编号, 8: TURN_RIGHT_30
+        # 这里需要根据实际情况映射，暂时使用简单映射
+        route_num = prediction['route_number']
+        if route_num == -1:
+            action = 0  # STOP
+            print(f"  -> Action: STOP")
+        elif route_num == 0:
+            action = 2  # TURN_LEFT
+            print(f"  -> Action: TURN_LEFT")
+        elif route_num == 8:
+            action = 3  # TURN_RIGHT
+            print(f"  -> Action: TURN_RIGHT")
+        else:
+            action = 1  # MOVE_FORWARD (默认)
+            print(f"  -> Action: MOVE_FORWARD (route {route_num})")
+        
+        # 执行动作
+        result = session.step(action)
+        
+        print(f"\n[RESULT]")
+        print(f"  Done: {result['done']}")
+        print(f"  Episode ID: {result['episode_id']}")
+        
+        # 如果任务完成，退出循环
+        if result['done']:
+            print("\n" + "=" * 60)
+            print("Episode 完成!")
+            print("=" * 60)
+            break
+    
+    # 关闭环境
+    session.close()
+    print("\n环境已关闭")
+
+
 if __name__ == "__main__":
-    run_single_scene_observe(EXP_CONFIG, RESULT_PATH, EPISODE_ID, SCENE_ID)
+    # 原始单步执行模式（不使用 agent）
+    # run_single_scene_observe(EXP_CONFIG, RESULT_PATH, EPISODE_ID, SCENE_ID)
+    
+    # 使用 RVLN Agent 自动导航模式
+    run_with_agent_demo(EXP_CONFIG, RESULT_PATH, EPISODE_ID, SCENE_ID, max_steps=20)
