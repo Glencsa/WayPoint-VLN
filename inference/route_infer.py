@@ -114,13 +114,8 @@ if __name__ == "__main__":
     
     # 场景 1: 只有当前一张图 (刚启动)
     # 系统会自动补齐为: [黑, 黑, 黑, 黑, Img1]
-<<<<<<< HEAD
     rgb_1 = ["test_data/rgb.jpg"]
     depth_1 = ["test_data/depth.jpg"]
-=======
-    rgb_1 = ["/home/yang/VLN/RVLN/rgb.jpg"]
-    depth_1 = ["/home/yang/VLN/RVLN/depth.jpg"]
->>>>>>> 17869e39233c319db8a7deda4ec2d77cbb38faf2
     run_inference(model, processor, rgb_1, depth_1, instruction)
 
     # # 场景 2: 已经走了几步 (历史队列)

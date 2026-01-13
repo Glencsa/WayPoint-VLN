@@ -78,6 +78,22 @@ def prepare_inputs_for_generate(rgb_queue, depth_queue, instruction, processor, 
                 return Image.new('RGB', (224, 224), (0, 0, 0))
         elif isinstance(item, Image.Image): # 如果已经是 PIL Image
             return item.convert("RGB")
+        elif isinstance(item, np.ndarray): # 如果是 numpy 数组
+            # ================= [关键修改] =================
+            # 1. 处理维度问题: (H, W, 1) -> (H, W)
+            if item.ndim == 3 and item.shape[2] == 1:
+                item = item.squeeze(2)  # 去掉最后一个维度
+            
+            # 2. 确保数据是 uint8 类型 (防止 float32 报错)
+            if item.dtype != np.uint8:
+                # 简单的归一化兼容
+                if item.max() <= 1.0:
+                    item = (item * 255).astype(np.uint8)
+                else:
+                    item = item.astype(np.uint8)
+            # ============================================
+            
+            return Image.fromarray(item).convert("RGB")
         else:
             return Image.new('RGB', (224, 224), (0, 0, 0))
 
