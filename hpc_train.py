@@ -26,77 +26,62 @@ class WeightedTrainer(Trainer):
         super().__init__(*args, **kwargs)
         
         # ==================== 1. 初始化 Token 映射与超参数 ====================
-        self.target_token_ids = set() # 用于基础加权 Mask (包含 -1)
-        self.id_to_value = {}         # 用于距离计算 (只包含 0-8)
-        self.digit_canonical_ids = [] # 存储 0-8 的标准 Token ID，用于提取 Soft Logits
+        self.id_to_value = {}        # 仅存 0-8，用于 Soft Loss
+        self.digit_canonical_ids = [] # 存储 0-8 的标准 Token ID
+        self.minus_token_ids = set()  #专门存储负号相关的 Token ID
+        self.key_token_weight = 1.0    # 普通数字 (0-8) 的权重
+        self.minus_token_weight = 20.0 
+        self.soft_loss_weight = 5.0    # 软标签权重
+        self.sigma = 2.0               # 高斯分布标准差
+
+        # --- A. 注册负号 (Stop Signal) ---
+        # 只要包含负号，就认为是停止意图的开始，给予重罚
+        minus_candidates = ["-", " -", "-1", " -1"]
+        for s in minus_candidates:
+            tid = self.tokenizer.convert_tokens_to_ids(s)
+            if tid != self.tokenizer.unk_token_id:
+                self.minus_token_ids.add(tid)
         
-        # --- 超参数设置 ---
-        self.key_token_weight = 1.0  # 硬标签权重 (做对了奖励大)
-        self.soft_loss_weight = 5.0   # 软标签权重 (控制距离惩罚的力度)
-        self.sigma = 2.0              # 高斯分布标准差 (越大越宽容)
-        # --- A. 注册数字 0-8 (参与高斯计算) ---
+        # 打印日志确保加载成功
+        if self.is_world_process_zero():
+            print(f"🛑 Stop/Minus Tokens Registered: {self.minus_token_ids} (Weight: {self.minus_token_weight})")
+
+        # --- B. 注册数字 0-8 (参与高斯计算) ---
         for i in range(9):
             s = str(i)
-            # 获取该数字的所有可能 Token ID (例如 "1", " 1")
             ids = [
                 self.tokenizer.convert_tokens_to_ids(s),
                 self.tokenizer.convert_tokens_to_ids(" " + s)
             ]
             
-            # 记录第一个有效的 ID 作为该数字的"代表"，用于提取 Logits 计算 Soft Loss
-            # (通常 tokenizer 的第一个结果就是最常用的)
             canonical_added = False
-            
             for tid in ids:
                 if tid != self.tokenizer.unk_token_id:
-                    self.target_token_ids.add(tid)
-                    self.id_to_value[tid] = i  # 建立 ID -> 整数值 的映射
-                    
-                    if not canonical_added:
-                        self.digit_canonical_ids.append(tid)
-                        canonical_added = True
+                    # [关键] 只有当它不是负号集合里的 ID 时，才注册为普通数字
+                    # 防止 "-1" 这个 token 被同时注册
+                    if tid not in self.minus_token_ids:
+                        self.id_to_value[tid] = i
+                        
+                        if not canonical_added:
+                            self.digit_canonical_ids.append(tid)
+                            canonical_added = True
         
-        # 确保我们收集齐了 0-8 的代表 ID，否则无法进行 Softmax 计算
+        # 检查完整性
         if len(self.digit_canonical_ids) != 9:
             print("⚠️ Warning: 无法找到 0-8 的完整 Token ID，软标签逻辑可能受损。")
-
-        # --- B. 注册负号/-1 (只加权，不参与高斯) ---
-        # -1 代表 Stop，它在空间上没有"邻居"，所以只做硬分类
-        neg_ids = [
-            self.tokenizer.convert_tokens_to_ids("-"),
-            self.tokenizer.convert_tokens_to_ids(" -"),
-            self.tokenizer.convert_tokens_to_ids("-1"),
-            self.tokenizer.convert_tokens_to_ids(" -1")
-        ]
-        for tid in neg_ids:
-            if tid != self.tokenizer.unk_token_id:
-                self.target_token_ids.add(tid)
-                # 注意：不在 id_to_value 中注册
-
-        # 打印日志（只在主进程）
-        if self.is_world_process_zero():
-            print(f"WeightedTrainer Ready:")
-            print(f"  - Hard Weighted Tokens: {len(self.target_token_ids)}")
-            print(f"  - Distance Aware Tokens: 0-8 (Sigma={self.sigma})")
+        else:
+            if self.is_world_process_zero():
+                print(f"✅ Navigation Tokens Registered: 0-8 (Sigma={self.sigma})")
 
     def generate_gaussian_target(self, gt_values, num_classes=9):
         """
         生成高斯分布目标
-        gt_values: [Batch] 真实的数字值 (0-8)
         """
         device = gt_values.device
-        # 创建 [Batch, 9] 的矩阵，每一行都是 0,1,2...8
         target_indices = torch.arange(num_classes, device=device).expand(len(gt_values), -1)
-        # 扩展 GT: [Batch, 1] -> [Batch, 9]
         gt_expand = gt_values.unsqueeze(1).expand(-1, num_classes)
-        
-        # 计算距离平方
         distance = (target_indices - gt_expand).float() ** 2
-        
-        # 高斯公式: exp(-dist / 2*sigma^2)
         scores = torch.exp(-distance / (2 * self.sigma ** 2))
-        
-        # 归一化 (Sum = 1)，这就变成了一个概率分布
         probs = scores / scores.sum(dim=1, keepdim=True)
         return probs
 
@@ -104,51 +89,46 @@ class WeightedTrainer(Trainer):
         """
         Loss = Hard_Weighted_CE + Alpha * Soft_Gaussian_KL
         """
-        # 1. 获取 Labels
+        # 1-4. 前向传播与展平
         labels = inputs.get("labels")
-        
-        # 2. 前向传播
         outputs = model(**inputs)
         logits = outputs.get("logits")
 
-        # 3. Shift 操作 (对齐 Logits 和 Labels)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        # 4. 展平
         batch_size, seq_len, vocab_size = shift_logits.shape
         flat_logits = shift_logits.view(-1, vocab_size)
         flat_labels = shift_labels.view(-1)
 
         # ==================== Part 1: 基础加权 Loss (Hard Target) ====================
-        # 计算所有 Token 的 CrossEntropy
         loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
         token_losses = loss_fct(flat_logits, flat_labels)
 
-        # 构建权重矩阵
+        # 初始化权重为 1.0
         weights = torch.ones_like(token_losses)
-        
-        # 标记哪些位置是需要计算距离的数字 (0-8)
+
+        for mid in self.minus_token_ids:
+            weights[flat_labels == mid] = self.minus_token_weight
+
+        # 准备 Soft Loss 变量
         ordinal_mask = torch.zeros_like(token_losses, dtype=torch.bool)
-        # 存储这些位置对应的真实整数值
         ordinal_gt_values = torch.zeros_like(flat_labels, dtype=torch.long)
 
-        # 应用权重并识别数字
-        # (这里为了代码清晰使用了循环，Token 只有十几个，开销可忽略)
-        for target_id in self.target_token_ids:
-            is_target = (flat_labels == target_id)
-            # 加权
-            weights[is_target] = self.key_token_weight
+        # [修改点 3] 处理数字 0-8
+        # 注意：这里的 id_to_value 已经被我们在 __init__ 里清洗过，不包含负号
+        for tid, val in self.id_to_value.items():
+            is_digit = (flat_labels == tid)
             
-            # 如果是 0-8，加入 Soft Loss 计算队列
-            if target_id in self.id_to_value:
-                ordinal_mask |= is_target
-                # 记录该 Token ID 对应的整数值 (例如 ID 299 -> Value 8)
-                ordinal_gt_values[is_target] = self.id_to_value[target_id]
+            # 如果是普通数字，我们可以给它 key_token_weight (1.0)，也可以给更高，这里保持 1.0
+            # 这里的 is_digit 会和上面的负号逻辑天然互斥 (ID 不会重复)
+            if is_digit.any():
+                # 只有 0-8 才开启 Soft Loss
+                ordinal_mask |= is_digit
+                ordinal_gt_values[is_digit] = val
 
+        # 计算最终加权的 Hard Loss
         weighted_loss = token_losses * weights
-        
-        # 计算平均 Hard Loss
         active_elements = (flat_labels != -100).sum()
         base_loss = weighted_loss.sum() / (active_elements + 1e-6)
 
@@ -156,25 +136,19 @@ class WeightedTrainer(Trainer):
         soft_loss = torch.tensor(0.0, device=flat_logits.device)
         
         if ordinal_mask.any():
-            # 1. 取出属于数字的样本的 Logits
-            # 我们只关心模型在 0-8 这 9 个 Token 上的表现
-            # digit_canonical_ids 是我们预先存好的 [id_0, id_1, ..., id_8]
+            # 1. 提取 Logits
             digit_ids_tensor = torch.tensor(self.digit_canonical_ids, device=flat_logits.device)
-            
-            # 提取 Mask 对应的 Logits 行，且只提取 9 个数字列 -> [N_ordinal, 9]
             subset_logits = flat_logits[ordinal_mask][:, digit_ids_tensor]
             
-            # 2. 计算 Log Softmax (模型预测分布)
+            # 2. 计算预测分布
             subset_log_probs = F.log_softmax(subset_logits, dim=-1)
             
-            # 3. 生成高斯目标分布 (Target分布) -> [N_ordinal, 9]
+            # 3. 生成高斯目标
             subset_gt = ordinal_gt_values[ordinal_mask]
             soft_targets = self.generate_gaussian_target(subset_gt, num_classes=9)
             
-            # 4. 计算 KL 散度 (KLDiv = -Sum(P_target * log P_pred))
-            # 衡量模型分布与高斯分布的差异
+            # 4. KL 散度
             kl_loss = F.kl_div(subset_log_probs, soft_targets, reduction='batchmean')
-            
             soft_loss = kl_loss
 
         # ==================== Part 3: 总 Loss ====================
@@ -183,31 +157,17 @@ class WeightedTrainer(Trainer):
         return (final_loss, outputs) if return_outputs else final_loss
 
     def save_model(self, output_dir=None, _internal_call=False):
-        """
-        修正后的保存逻辑：
-        1. 兼容 DeepSpeed (使用 unwrap_model)
-        2. 保存 LoRA
-        3. 保存 Stage 1 冻结权重 (让每个 checkpoint 都能独立运行)
-        """
+
         if output_dir is None:
             output_dir = self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # 仅在主进程执行
         if self.is_world_process_zero():
             print(f"💾 Saving Checkpoint to {output_dir}...")
-            
-            # 1. 关键：正确解包模型 (兼容 DeepSpeed Zero-2/3)
-            # self.accelerator 是 Trainer 自带的属性
             unwrapped_model = self.accelerator.unwrap_model(self.model)
-            
-            # 2. 保存 LoRA (LLM 部分)
-            # 你的 LoRA 是在 language_model 上，且它是 PeftModel
             peft_model = unwrapped_model.language_model
             peft_model.save_pretrained(output_dir)
             
-            # 3. [新增] 保存 Stage 1 权重 (Fusion & Depth)
-            # 这样 checkpoint 文件夹里就有了 stage1_visual_weights.pth
             stage1_weights = {}
             for name, param in unwrapped_model.named_parameters():
                 if "language_model" not in name:
@@ -215,14 +175,11 @@ class WeightedTrainer(Trainer):
             
             torch.save(stage1_weights, os.path.join(output_dir, "stage1_visual_weights.pth"))
 
-            # 4. 保存 Processor / Tokenizer
             saver = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
             if saver:
                 saver.save_pretrained(output_dir)
-                
-            # 5. 保存 LoRA Config
+            
             peft_model.config.save_pretrained(output_dir)
-
             print(f"✅ Checkpoint saved: LoRA + Stage1 Weights included.")
 def main():
     # =================Configuration=================
