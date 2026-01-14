@@ -5,7 +5,8 @@ import torch.nn.functional as F
 from transformers import (
     InstructBlipForConditionalGeneration, 
     InstructBlipConfig, 
-    ViTModel
+    ViTModel,
+    ViTConfig
 )
 from models.fusion_depth import DepthCrossAttentionFusion
 
