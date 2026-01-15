@@ -37,6 +37,8 @@
   </a>
 </p>
 
+## Model Architecture
+![](Archi.drawio.png)
 ## 🔥 News
 ### Some implementation details will coming soon...
 
