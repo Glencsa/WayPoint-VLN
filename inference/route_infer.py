@@ -40,7 +40,7 @@ def load_model():
         print(f"📥 发现 ITM 权重: {stage1_checkpoint}，正在加载覆盖...")
         checkpoint = torch.load(stage1_checkpoint, map_location="cpu")
         if 'depth_backbone' in checkpoint:
-            model.depth_backbone.load_state_dict(checkpoint['depth_backbone'], strict=True)
+            model.depth_backbone.load_state_dict(checkpoint['depth_backbone'], strict=False)
         else :
             print("   ⚠️ 警告: ITM 权重中未找到 depth_backbone 部分，跳过该部分加载。")
         if 'visual_fusion' in checkpoint:

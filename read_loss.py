@@ -99,7 +99,7 @@ def plot_loss(loss_data):
 if __name__ == "__main__":
     # 在这里修改你的日志文件夹路径
     # 默认为当前目录下的 txt_log 文件夹，或者你可以改成 '.' 表示当前目录
-    log_directory = "/home/isvl/guan_code/RVLN/log/log1" 
+    log_directory = "/home/isvl/guan_code/WayPoint-VLN/log" 
     
     data = parse_loss_files(log_directory)
     plot_loss(data)

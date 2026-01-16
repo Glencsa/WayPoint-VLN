@@ -19,7 +19,8 @@ except ImportError:
 
 from transformers import (
     InstructBlipProcessor,
-    BertTokenizer
+    BertTokenizer,
+    AutoTokenizer
 )
 
 # ================= 配置区域 =================
@@ -60,8 +61,9 @@ def load_combined_model():
     print(f"   -> Tokenizer IDs: <history>={hist_id}, <current>={curr_id}, Vocab={vocab_size}")
 
     # 3. 加载 ITM 专用的 Q-Former Tokenizer
-    qformer_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-
+    qformer_tokenizer_path = os.path.join(RVLN_MODEL_PATH, "qformer_tokenizer")
+    print(f" -> Loading Q-Former Tokenizer from: {qformer_tokenizer_path}")
+    qformer_tokenizer = AutoTokenizer.from_pretrained(qformer_tokenizer_path)
     # 4. 加载 RvlnMultiTask 模型
     print(f"加载 RvlnMultiTask 模型: {RVLN_MODEL_PATH} ...")
     model = RvlnMultiTask.from_pretrained(
@@ -86,7 +88,7 @@ def load_combined_model():
         print(f"📥 发现 ITM 权重: {ITM_CHECKPOINT_PATH}，正在加载覆盖...")
         checkpoint = torch.load(ITM_CHECKPOINT_PATH, map_location="cpu")
         if 'depth_backbone' in checkpoint:
-            model.depth_backbone.load_state_dict(checkpoint['depth_backbone'], strict=True)
+            model.depth_backbone.load_state_dict(checkpoint['depth_backbone'], strict=False)
         else :
             print("   ⚠️ 警告: ITM 权重中未找到 depth_backbone 部分，跳过该部分加载。")
         if 'visual_fusion' in checkpoint:

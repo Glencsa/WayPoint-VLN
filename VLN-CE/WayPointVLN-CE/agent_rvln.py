@@ -62,7 +62,7 @@ class RVLN_Agent(Agent):
                 self.model_path,
                 torch_dtype=self.dtype,
             ).to(self.device)
-            stage1_checkpoint = "/home/isvl/guan_code/RVLN/output/stage1_checkpoint/latest_checkpoint.pth"
+            stage1_checkpoint = "/home/isvl/guan_code/WayPoint-VLNoutput/stage1_checkpoint/latest_checkpoint.pth"
             if os.path.exists(stage1_checkpoint):
                 print(f"📥 Loading Stage 1 Checkpoint from: {stage1_checkpoint}")
                 ckpt = torch.load(stage1_checkpoint, map_location="cpu")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # 绝对路径配置（请按需修改为你的实际绝对路径）
-BASE_DIR = "/home/isvl/guan_code/RVLN/VLN-CE/NaVid-VLN-CE"
+BASE_DIR = "/home/isvl/guan_code/WayPoint-VLNVLN-CE/NaVid-VLN-CE"
 EXP_CONFIG = f"{BASE_DIR}/VLN_CE/vlnce_baselines/config/r2r_baselines/cma.yaml"  # 示例，占位
 RESULT_PATH = f"{BASE_DIR}/results"
 EPISODE_ID = "6296"  # 优先使用 episode 过滤，若不想用则置为 None
@@ -20,7 +20,7 @@ from habitat import Env
 from VLN_CE.vlnce_baselines.config.default import get_config
 
 # RVLN 模型配置
-CHECKPOINT_PATH = "/home/isvl/guan_code/RVLN/output/rvln_merged_final"
+CHECKPOINT_PATH = "/home/isvl/guan_code/WayPoint-VLNoutput/rvln_merged_final"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16
 

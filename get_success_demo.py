@@ -87,6 +87,6 @@ if __name__ == "__main__":
     # 使用说明：
     # 1. 确保当前目录下有 log 文件夹（存放json）
     # 2. 确保当前目录下有 video 文件夹（存放gif）
-    process_success_data(log_dir="/home/isvl/guan_code/RVLN/VLN-CE/WayPointVLN-CE/tmp/rvln/log",
-                         video_dir="/home/isvl/guan_code/RVLN/VLN-CE/WayPointVLN-CE/tmp/rvln/video",
-                         output_dir="/home/isvl/guan_code/RVLN/VLN-CE/WayPointVLN-CE/tmp/rvln/success_clips")
+    process_success_data(log_dir="/home/isvl/guan_code/WayPoint-VLN/VLN-CE/WayPointVLN-CE/tmp/WayPoint-VLN/log",
+                         video_dir="/home/isvl/guan_code/WayPoint-VLN/VLN-CE/WayPointVLN-CE/tmp/WayPoint-VLN/video",
+                         output_dir="/home/isvl/guan_code/WayPoint-VLN/VLN-CE/WayPointVLN-CE/tmp/WayPoint-VLN/success_clips")

@@ -57,6 +57,7 @@ datasets/
 checkpoint/
 dataset_waypoint/
 logs/
+log/
 lora_weight/
 test.jpeg
 test_data/

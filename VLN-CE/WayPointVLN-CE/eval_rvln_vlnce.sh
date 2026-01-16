@@ -4,7 +4,7 @@ CHUNKS=1
 
 ################ NaVid ################
 
-MODEL_PATH="/home/isvl/guan_code/RVLN/output/rvln_merged_final" 
+MODEL_PATH="/home/isvl/guan_code/WayPoint-VLN/output/rvln_merged_final" 
 MODEL_NAME="rvln" # uni-navid or navid
 EXP_SAVE="video-data" # use "data" to accelerate evaluation
 
