@@ -11,9 +11,7 @@ from models.WayPointVLN import RvlnMultiTask
 from models.depth_estimate import DepthEstimator
 import swanlab
 
-# ==============================================================================
-# 2. Dataset 定义 (保持不变)
-# ==============================================================================
+
 class Flickr30kDataset(Dataset):
     def __init__(self, image_root, caption_file):
         self.image_root = image_root
@@ -61,7 +59,7 @@ def collate_fn(batch):
 
 def create_itm_batch(images, depth_images, captions, image_names, dataset):
     """
-    dataset: 可以是 Flickr30kDataset 或 torch.utils.data.Subset
+    dataset:  Flickr30kDataset | torch.utils.data.Subset
     """
     batch_size = len(images)
     positive_images = list(images)
@@ -73,24 +71,18 @@ def create_itm_batch(images, depth_images, captions, image_names, dataset):
     negative_depth_images = list(depth_images)
     negative_texts = []
 
-    # 1. 识别是否为 Subset，获取正确的数据源和索引范围
     if isinstance(dataset, torch.utils.data.Subset):
-        source_dataset = dataset.dataset  # 获取原始数据集(Flickr30kDataset)
-        valid_indices = dataset.indices   # 获取当前划分(训练/验证)的有效索引列表
+        source_dataset = dataset.dataset  
+        valid_indices = dataset.indices   
     else:
         source_dataset = dataset
-        valid_indices = range(len(dataset)) # 如果是全量数据集，索引就是 0 到 len-1
+        valid_indices = range(len(dataset)) 
 
     for i in range(batch_size):
         current_image_name = image_names[i]
         while True:
-            # 2. 从当前划分(Subset)的有效索引中随机选择
             random_idx = random.choice(valid_indices)
-            
-            # 3. 从源数据集中获取元数据 (name, caption)
-            # 注意：这里直接访问 samples 列表，避免调用 __getitem__ 加载图片，提高速度
             other_image_name, other_caption = source_dataset.samples[random_idx]
-            
             if other_image_name != current_image_name:
                 negative_texts.append(other_caption)
                 break
@@ -107,10 +99,6 @@ def create_itm_batch(images, depth_images, captions, image_names, dataset):
     all_images, all_depth_images, all_texts, all_labels = zip(*combined)
     return list(all_images), list(all_depth_images), list(all_texts), torch.tensor(all_labels, dtype=torch.long)
 
-# ==============================================================================
-# [新增] 验证函数
-# ==============================================================================
-# 修改函数签名，将 full_dataset 改为 val_dataset (命名更准确)
 def validate(model, dataloader, val_dataset, device, processor, tokenizer, criterion):
     model.eval()
     total_loss = 0
@@ -120,14 +108,10 @@ def validate(model, dataloader, val_dataset, device, processor, tokenizer, crite
     print("\n[Validation] Starting evaluation on validation set...")
     with torch.no_grad():
         for step, (images, depth_images, captions, image_names) in enumerate(dataloader):
-            # 传入 val_dataset (Subset对象)
-            # 修正后的 create_itm_batch 会自动处理 Subset，只从验证集中选负样本
             itm_images_pil, itm_depth_images, itm_texts, itm_labels = create_itm_batch(
                 images, depth_images, captions, image_names, val_dataset
             )
             itm_labels = itm_labels.to(device)
-            
-            # ... (后续代码保持不变) ...
             image_inputs = processor(images=itm_images_pil, return_tensors="pt").to(device)
             depth_inputs = processor(images=itm_depth_images, return_tensors="pt").to(device)
             text_inputs = tokenizer(
@@ -153,9 +137,6 @@ def validate(model, dataloader, val_dataset, device, processor, tokenizer, crite
     print(f"[Validation] Done. Avg Loss: {avg_loss:.4f}, Avg Acc: {avg_acc:.4f}\n")
     return avg_loss, avg_acc
 
-# ==============================================================================
-# 4. 主训练循环
-# ==============================================================================
 if __name__ == "__main__":
     args = {
         "model_name": "./instructblip-vicuna-7b",
@@ -187,7 +168,6 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    # --- 模型与处理器加载 ---
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     special_tokens = {"additional_special_tokens": ["<history>", "<current>"]}
     tokenizer.add_special_tokens(special_tokens)
@@ -196,11 +176,9 @@ if __name__ == "__main__":
     curr_id = tokenizer.convert_tokens_to_ids("<current>")
     print(f"Token IDs injected: History={hist_id}, Current={curr_id}")
 
-    # 3. 加载 Config 对象
     config = InstructBlipConfig.from_pretrained(MODEL_NAME)
 
-    # 4. 【关键步骤】将 ID 手动写入 Config 对象
-    # 这一步必须在 model 初始化之前完成！
+
     config.history_token_id = hist_id
     config.current_token_id = curr_id
     print(f"Loading Processor from {MODEL_NAME}...")
@@ -220,7 +198,6 @@ if __name__ == "__main__":
     if not LOAD_IN_8BIT:
         model.to(device)
 
-    # --- 冻结/解冻参数 ---
     trainable_modules = ["itm_head", "visual_fusion","qformer", "query_tokens", "depth_backbone"] 
     for name, param in model.named_parameters():
         if any(m in name for m in trainable_modules):
@@ -229,7 +206,6 @@ if __name__ == "__main__":
         else:
             param.requires_grad = False
             
-    # --- 优化器 ---
     fusion_params = list(map(id, model.visual_fusion.parameters()))
     base_params = filter(lambda p: id(p) not in fusion_params and p.requires_grad, model.parameters())
     optimizer = torch.optim.AdamW([
@@ -238,7 +214,6 @@ if __name__ == "__main__":
     ], weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000)
     
-    # --- 【核心修改】数据划分 ---
     full_dataset = Flickr30kDataset(IMAGE_ROOT, CAPTION_FILE)
     
     val_size = int(len(full_dataset) * 0.1)
@@ -259,15 +234,13 @@ if __name__ == "__main__":
     num_epochs = 10
     save_every_steps = 500
     global_step = 0
-    best_val_acc = 0.0 # 记录历史最佳
+    best_val_acc = 0.0 
     
     model.train() 
 
     for epoch in range(num_epochs):
-        # 1. 训练阶段
         model.train()
         for step, (images, depth_images, captions, image_names) in enumerate(train_loader):
-            # 这里的 train_dataset 用于提供负样本池
             itm_images_pil, itm_depth_images, itm_texts, itm_labels = create_itm_batch(
                 images, depth_images, captions, image_names, train_dataset
             )
@@ -292,7 +265,6 @@ if __name__ == "__main__":
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
 
-            # 计算梯度范数
             fusion_grad_norm = 0.0
             for p in model.visual_fusion.parameters():
                 if p.grad is not None:
@@ -319,7 +291,6 @@ if __name__ == "__main__":
                 tokens_grad_norm = 0.0
             optimizer.step()
             
-            # 记录日志
             acc = (logits.argmax(dim=1) == itm_labels).float().mean().item()
             loss_val = loss.item()
             global_step += 1
@@ -340,7 +311,6 @@ if __name__ == "__main__":
 
             if global_step % save_every_steps == 0:
                 ckpt_path = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pth")
-                # [修改] 增加 qformer 和 query_tokens 的保存
                 torch.save({
                     "visual_fusion": model.visual_fusion.state_dict(),
                     "itm_head": model.itm_head.state_dict(),
@@ -352,7 +322,6 @@ if __name__ == "__main__":
 
         scheduler.step()
         
-        # 2. 验证阶段 (每个 Epoch 结束后)
         val_loss, val_acc = validate(model, val_loader, val_dataset, device, processor, qformer_tokenizer, criterion)
 
         # SwanLab Log (Validation)
@@ -362,11 +331,9 @@ if __name__ == "__main__":
             "val/epoch": epoch + 1
         })
         
-        # 3. 保存最佳模型
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_path = os.path.join(CHECKPOINT_DIR, "best_checkpoint.pth")
-            # [修改] 增加 qformer 和 query_tokens 的保存
             torch.save({
                 "epoch": epoch,
                 "val_acc": val_acc,
